@@ -1,13 +1,14 @@
 """Application entry point."""
 import sys
 
+from PySide6.QtCore import QSettings
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 from .__version__ import __version__
 from .config import APP_NAME, ORG_NAME, asset
+from .ui import style
 from .ui.main_window import MainWindow
-from .ui.style import STYLESHEET, light_palette
 
 
 def main() -> None:
@@ -23,13 +24,17 @@ def main() -> None:
     QApplication.setOrganizationName(ORG_NAME)
     QApplication.setApplicationVersion(__version__)
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)      # the window may hide to the tray
     app.setStyle("Fusion")
-    app.setPalette(light_palette())
-    app.setStyleSheet(STYLESHEET)
     app.setWindowIcon(QIcon(asset("icon.ico") if sys.platform == "win32" else asset("icon.png")))
+    settings = QSettings(ORG_NAME, APP_NAME)
+    style.apply(app, settings.value("appearance/theme", "system"))
 
-    window = MainWindow()
-    window.show()
+    minimized = "--minimized" in sys.argv
+    hide = minimized and settings.value("tray/enabled", False, type=bool)
+    window = MainWindow(start_hidden=hide)
+    if minimized and not hide:
+        window.showMinimized()
     files = [a for a in sys.argv[1:] if not a.startswith("-")]
     if files:  # e.g. files dropped onto the XML-ray shortcut
         window.load(files)

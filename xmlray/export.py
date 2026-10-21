@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import html
+import re
 from datetime import datetime
 
 from .analyzer import Analysis
@@ -22,20 +23,31 @@ def _e(text) -> str:
     return html.escape(str(text))
 
 
+def _rich(text: str) -> str:
+    out = _e(text).replace("`", "")
+    return re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r"<a href='\2'>\1</a>", out)
+
+
 def _steps(steps: list[str]) -> str:
     if not steps:
         return ""
-    items = "".join(f"<li>{_e(s).replace('`', '')}</li>" for s in steps)
+    items = "".join(f"<li>{_rich(s)}</li>" for s in steps)
     return f"<p class='todo'>What to do</p><ol>{items}</ol>"
 
 
-def html_summary(a: Analysis) -> str:
-    period = ""
+def _period(a) -> str:
     if a.begin and a.end:
-        period = f"{a.begin:%b %d, %Y} to {a.end:%b %d, %Y}"
+        return f"{a.begin:%b %d, %Y} to {a.end:%b %d, %Y}"
+    return ""
+
+
+def html_summary(a: Analysis, findings=None, dns_results=None, tls=None) -> str:
+    """Self-contained web page. *findings* defaults to the report findings only."""
+    period = _period(a)
+    findings = a.findings if findings is None else findings
     domains = ", ".join(sorted(a.policies)) or "No domain"
     cards = []
-    for f in a.findings:
+    for f in findings:
         fg, bg = SEV_COLORS[f.severity]
         cards.append(
             f"<section class='finding' style='border-left-color:{fg}'>"
@@ -67,19 +79,96 @@ td.n{{text-align:right;white-space:nowrap}} footer{{color:var(--muted);font-size
 <div>{a.total:,} messages checked, {a.pass_pct:.1f}% passed DMARC, {a.failed:,} failed.</div>
 <ul>{policies}</ul></div></div>
 <h2>Action plan</h2>{''.join(cards)}
+{_dns_html(dns_results)}{_tls_html(tls)}
 <h2>Who is sending email as you</h2><div class="wrap"><table><thead><tr><th>Status</th><th>Sender</th><th>IP address</th>
 <th>Messages</th><th>Passed</th><th>What this means</th></tr></thead><tbody>{rows}</tbody></table></div>
 <footer>Created by {APP_NAME} {__version__} ({TAGLINE.lower()}) on {datetime.now():%B %d, %Y}.</footer>
 </main></body></html>"""
 
 
-def senders_csv(a: Analysis, path: str) -> None:
+def _dns_html(dns_results) -> str:
+    if not dns_results:
+        return ""
+    rows = ""
+    for d, res in sorted(dns_results.items()):
+        for v in res.records:
+            rows += (f"<tr><td>{_e(v.kind)}</td><td>{_e(v.name)}</td><td>{_e(v.status)}</td>"
+                     f"<td style='word-break:break-all'>{_e(v.value or '(none)')}</td>"
+                     f"<td>{_e(v.note)}</td></tr>")
+    return ("<h2>Live DNS records</h2><div class='wrap'><table><thead><tr><th>Record</th>"
+            "<th>Name</th><th>Status</th><th>Value</th><th>Notes</th></tr></thead>"
+            f"<tbody>{rows}</tbody></table></div>")
+
+
+def _tls_html(tls) -> str:
+    if not tls or not tls.total:
+        return ""
+    rows = "".join(f"<tr><td>{_e(t)}</td><td class='n'>{n:,}</td></tr>"
+                   for t, n in tls.by_type.most_common())
+    table = (f"<div class='wrap'><table><thead><tr><th>Problem</th><th>Attempts</th></tr>"
+             f"</thead><tbody>{rows}</tbody></table></div>") if rows else ""
+    return (f"<h2>Secure delivery to you (TLS reports)</h2><p>{tls.total:,} connections "
+            f"reported, {tls.success_pct:.1f}% encrypted successfully.</p>{table}")
+
+
+def print_html(a: Analysis, findings=None, dns_results=None, tls=None) -> str:
+    """Simple HTML for the PDF export (Qt's renderer supports only basic CSS)."""
+    findings = a.findings if findings is None else findings
+    domains = ", ".join(sorted(a.policies)) or "No domain"
+    parts = [f"<h1 style='color:#17324A'>{APP_NAME} summary</h1>"
+             f"<p style='color:#5B7083'>{_e(domains)}. {_e(_period(a))}</p>",
+             "<table width='100%' cellpadding='8' style='background:#17324A;color:white'><tr>"
+             f"<td width='18%' align='center'><span style='font-size:30pt;color:white'><b>"
+             f"{_e(a.grade)}</b></span></td><td><b style='font-size:13pt'>{_e(a.grade_label)}"
+             f"</b><br>Health score {a.score} of 100<br>{a.total:,} messages checked, "
+             f"{a.pass_pct:.1f}% passed DMARC, {a.failed:,} failed.</td></tr></table>",
+             "<h2 style='color:#17324A'>Action plan</h2>"]
+    for f in findings:
+        fg, bg = SEV_COLORS[f.severity]
+        steps = "".join(f"<li>{_rich(s)}</li>" for s in f.steps)
+        parts.append(
+            "<table width='100%' cellspacing='0' cellpadding='6' style='margin-bottom:8px'>"
+            f"<tr><td width='6' style='background:{fg}'></td><td style='background:#F6F9FB'>"
+            f"<span style='color:{fg}'><b>{f.severity.title()}</b></span><br>"
+            f"<b style='font-size:11pt'>{_e(f.title)}</b><br>{_e(f.summary)}"
+            + (f"<br><b>What to do</b><ol>{steps}</ol>" if steps else "")
+            + "</td></tr></table>")
+    if dns_results:
+        parts.append("<h2 style='color:#17324A'>Live DNS records</h2><table width='100%' "
+                     "cellpadding='4' border='1' cellspacing='0' style='border-color:#D5DFE6'>"
+                     "<tr style='background:#F3F7F9'><th>Record</th><th>Status</th><th>Notes</th></tr>")
+        for d, res in sorted(dns_results.items()):
+            for v in res.records:
+                parts.append(f"<tr><td>{_e(v.kind)}<br><small>{_e(v.name)}</small></td>"
+                             f"<td>{_e(v.status)}</td><td>{_e(v.note)}</td></tr>")
+        parts.append("</table>")
+    if tls and tls.total:
+        parts.append(f"<h2 style='color:#17324A'>Secure delivery to you</h2><p>{tls.total:,} "
+                     f"connections reported, {tls.success_pct:.1f}% encrypted successfully.</p>")
+    parts.append("<h2 style='color:#17324A'>Who is sending email as you</h2><table width='100%' "
+                 "cellpadding='4' border='1' cellspacing='0' style='border-color:#D5DFE6'>"
+                 "<tr style='background:#F3F7F9'><th>Status</th><th>Sender</th><th>IP address</th>"
+                 "<th>Messages</th><th>Passed</th></tr>")
+    for s in a.sources[:200]:
+        parts.append(f"<tr><td>{_e(s.category_label)}</td><td>{_e(s.name)}</td><td>{_e(s.ip)}"
+                     f"</td><td align='right'>{s.messages:,}</td><td align='right'>"
+                     f"{s.pass_rate*100:.0f}%</td></tr>")
+    parts.append("</table>")
+    parts.append(f"<p style='color:#5B7083'><small>Created by {APP_NAME} {__version__} on "
+                 f"{datetime.now():%B %d, %Y}.</small></p>")
+    return "<html><body style='font-family:Segoe UI, Arial'>" + "".join(parts) + "</body></html>"
+
+
+def senders_csv(a: Analysis, path: str, owners: dict | None = None) -> None:
+    owners = owners or {}
     with open(path, "w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
-        w.writerow(["Status", "Sender", "Hostname", "IP address", "Messages", "Passed DMARC",
-                    "Failed DMARC", "SPF aligned", "DKIM aligned", "Delivered as",
-                    "From domains", "What this means"])
+        w.writerow(["Status", "Sender", "Hostname", "IP address", "Network owner", "Messages",
+                    "Passed DMARC", "Failed DMARC", "SPF aligned", "DKIM aligned",
+                    "Delivered as", "From domains", "First seen", "Last seen", "What this means"])
         for s in a.sources:
-            w.writerow([s.category_label, s.name, s.hostname, s.ip, s.messages, s.dmarc_pass,
-                        s.failed, s.spf_aligned, s.dkim_aligned, s.delivered_summary,
-                        "; ".join(s.header_from), s.meaning])
+            w.writerow([s.category_label, s.name, s.hostname, s.ip, owners.get(s.ip, ""),
+                        s.messages, s.dmarc_pass, s.failed, s.spf_aligned, s.dkim_aligned,
+                        s.delivered_summary, "; ".join(s.header_from),
+                        f"{s.first_seen:%Y-%m-%d}" if s.first_seen else "",
+                        f"{s.last_seen:%Y-%m-%d}" if s.last_seen else "", s.meaning])

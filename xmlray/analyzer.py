@@ -3,9 +3,10 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Iterable
 
+from .guides import guide_step
 from .parser import Report
 from .senders import identify_provider
 
@@ -18,6 +19,7 @@ CATEGORY_LABELS = {
     "service_failing": "Failing, known service",
     "unknown": "Failing, unknown sender",
     "forwarded": "Forwarded",
+    "ignored": "Ignored",
 }
 
 DISPOSITION_WORDS = {"none": "delivered", "quarantine": "sent to spam", "reject": "rejected"}
@@ -46,6 +48,10 @@ class SourceSummary:
     hostname: str = ""
     provider: str = ""
     category: str = ""
+    nickname: str = ""         # the user's own name for this server
+    status: str = ""           # "mine", "ignore" or ""
+    first_seen: datetime | None = None
+    last_seen: datetime | None = None
 
     @property
     def failed(self) -> int:
@@ -57,12 +63,12 @@ class SourceSummary:
 
     @property
     def name(self) -> str:
-        return self.provider or self.hostname or "Unrecognised server"
+        return self.nickname or self.provider or self.hostname or "Unrecognised server"
 
     @property
     def label(self) -> str:
-        """Short name for sentences: service, hostname or IP address."""
-        return self.provider or self.hostname or self.ip
+        """Short name for sentences: your name for it, service, hostname or IP address."""
+        return self.nickname or self.provider or self.hostname or self.ip
 
     @property
     def category_label(self) -> str:
@@ -76,6 +82,11 @@ class SourceSummary:
     @property
     def meaning(self) -> str:
         c = self.category
+        if c == "ignored":
+            return "You chose to ignore this sender. It's left out of the action plan."
+        if c == "service_failing" and self.status == "mine":
+            return (f"You marked this as your own sender, but it's failing. Set up SPF or "
+                    f"DKIM for {self.label}.")
         if c == "authorized":
             return "Allowed to send as you. Nothing to do."
         if c == "partial":
@@ -120,6 +131,8 @@ class Finding:
     steps: list[str] = field(default_factory=list)
     affected: int = 0
     ips: list[str] = field(default_factory=list)
+    key: str = ""              # stable ID, used for "mark as done"
+    source: str = "reports"    # "reports", "dns" or "tls"
 
 
 @dataclass
@@ -152,7 +165,9 @@ class Analysis:
 
 # ------------------------------------------------------------------ aggregation
 
-def _aggregate(reports: Iterable[Report], hostnames: dict[str, str]) -> dict[str, SourceSummary]:
+def _aggregate(reports: Iterable[Report], hostnames: dict[str, str],
+               labels: dict[str, tuple[str, str]] | None = None) -> dict[str, SourceSummary]:
+    labels = labels or {}
     sources: dict[str, SourceSummary] = {}
     for rep in reports:
         dom = rep.policy.domain
@@ -160,6 +175,10 @@ def _aggregate(reports: Iterable[Report], hostnames: dict[str, str]) -> dict[str
             s = sources.get(rec.source_ip)
             if s is None:
                 s = sources[rec.source_ip] = SourceSummary(ip=rec.source_ip)
+            if s.first_seen is None or rep.begin < s.first_seen:
+                s.first_seen = rep.begin
+            if s.last_seen is None or rep.end > s.last_seen:
+                s.last_seen = rep.end
             n = rec.count
             s.messages += n
             s.by_domain[dom][0] += n
@@ -198,10 +217,15 @@ def _aggregate(reports: Iterable[Report], hostnames: dict[str, str]) -> dict[str
         hint_domains = list(s.envelope_from) + [k.split("|")[0] for k in s.dkim_domains] \
             + [k.split("|")[0] for k in s.spf_domains]
         s.provider = identify_provider(s.hostname, hint_domains)
-        if s.pass_rate >= 0.9:
+        s.nickname, s.status = labels.get(s.ip, ("", ""))
+        if s.status == "ignore":
+            s.category = "ignored"
+        elif s.pass_rate >= 0.9:
             s.category = "authorized"
         elif s.dmarc_pass > 0:
             s.category = "partial"
+        elif s.status == "mine":
+            s.category = "service_failing"
         elif s.forwarded >= s.messages * 0.5:
             s.category = "forwarded"
         elif s.provider:
@@ -231,7 +255,8 @@ def _fmt_domains(counter: Counter, limit: int = 3) -> str:
     return ", ".join(dict.fromkeys(names)) or "unknown"
 
 
-def _service_steps(name: str, group: list[SourceSummary], domains: str) -> list[str]:
+def _service_steps(name: str, group: list[SourceSummary], domains: str,
+                   guide_provider: str = "") -> list[str]:
     steps: list[str] = []
     dkim_aligned = sum(s.dkim_aligned for s in group)
     dkim_pass = sum(s.dkim_auth_pass for s in group)
@@ -265,6 +290,8 @@ def _service_steps(name: str, group: list[SourceSummary], domains: str) -> list[
     if not steps:
         steps.append("Some messages pass and some fail. Check whether a second account or "
                      "server for this service is sending without your DKIM key.")
+    if guide_provider:
+        steps.append(guide_step(guide_provider))
     steps.append("After fixing it, new reports (usually within 1–2 days) should show this "
                  "sender as Passing.")
     return steps
@@ -276,10 +303,11 @@ def _source_findings(sources: list[SourceSummary], domains: str) -> list[Finding
     groups: dict[str, list[SourceSummary]] = defaultdict(list)
     for s in sources:
         if s.category in ("service_failing", "partial"):
-            groups[s.provider or "__unnamed__"].append(s)
+            groups[s.nickname or s.provider or "__unnamed__"].append(s)
 
     for provider, group in groups.items():
         name = provider if provider != "__unnamed__" else "Unrecognised servers"
+        real_provider = next((s.provider for s in group if s.provider), "")
         failed = sum(s.failed for s in group)
         blocked = sum(s.fail_blocked for s in group)
         known = provider != "__unnamed__"
@@ -304,8 +332,9 @@ def _source_findings(sources: list[SourceSummary], domains: str) -> list[Finding
             summary = (f"{failed:,} of {sum(s.messages for s in group):,} messages from "
                        f"{name} failed. The rest passed, so this is usually a partial "
                        "setup problem rather than spoofing.")
-        steps = _service_steps(name if known else "the sending service", group, domains)
-        findings.append(Finding(sev, title, summary, steps, failed, ips))
+        steps = _service_steps(name if known else "the sending service", group, domains,
+                               real_provider)
+        findings.append(Finding(sev, title, summary, steps, failed, ips, key=f"service:{provider}"))
 
     unknown = [s for s in sources if s.category == "unknown"]
     delivered = sum(s.fail_delivered for s in unknown)
@@ -324,14 +353,14 @@ def _source_findings(sources: list[SourceSummary], domains: str) -> list[Finding
                 "If you don't recognise them, move your DMARC policy to p=quarantine, then "
                 "p=reject, so receivers block these messages.",
             ],
-            delivered, [s.ip for s in unknown if s.fail_delivered]))
+            delivered, [s.ip for s in unknown if s.fail_delivered], key="unknown-delivered"))
     if blocked:
         findings.append(Finding(
             "good",
             "Your policy stopped suspicious email",
             f"{blocked:,} messages from unrecognised servers failed DMARC and were sent to "
             "spam or rejected. That's DMARC protecting your domain.",
-            [], blocked, [s.ip for s in unknown if s.fail_blocked]))
+            [], blocked, [s.ip for s in unknown if s.fail_blocked], key="unknown-blocked"))
 
     fwd = [s for s in sources if s.category == "forwarded"]
     if fwd:
@@ -341,7 +370,7 @@ def _source_findings(sources: list[SourceSummary], domains: str) -> list[Finding
             "Some email was forwarded",
             f"{n:,} messages passed through forwarding services or mailing lists, which "
             "can break SPF. Receivers recognised this, so there's nothing to fix.",
-            [], n, [s.ip for s in fwd]))
+            [], n, [s.ip for s in fwd], key="forwarded"))
 
     spf_only = [s for s in sources if s.category == "authorized" and s.dkim_aligned == 0]
     if spf_only:
@@ -353,7 +382,7 @@ def _source_findings(sources: list[SourceSummary], domains: str) -> list[Finding
             "forwarded, so adding DKIM makes your mail more reliable.",
             ["Turn on DKIM signing with your own domain for each of these services, and "
              "publish the DKIM record each one provides."],
-            sum(s.messages for s in spf_only), [s.ip for s in spf_only]))
+            sum(s.messages for s in spf_only), [s.ip for s in spf_only], key="dkim-missing"))
     return findings
 
 
@@ -378,19 +407,19 @@ def _policy_findings(policies: dict[str, DomainPolicy]) -> list[Finding]:
                 "to 100, then change the policy to p=reject.",
             ]
             findings.append(Finding("medium", f"{d} is in monitoring mode (p=none)", summary,
-                                    steps, dp.messages))
+                                    steps, dp.messages, key=f"policy-none:{d}"))
         elif dp.p == "quarantine" and dp.pct >= 100 and dp.ready_to_enforce:
             findings.append(Finding(
                 "low", f"{d} is ready for p=reject",
                 "Failing email is going to spam, and your legitimate senders are passing. "
                 "Rejecting it outright gives the strongest protection.",
                 [f"Edit the TXT record at {record_name} and change p=quarantine to `p=reject`."],
-                dp.messages))
+                dp.messages, key=f"policy-ready:{d}"))
         elif dp.p == "reject" and dp.pct >= 100 and dp.testing != "y":
             findings.append(Finding(
                 "good", f"{d} is fully protected (p=reject)",
                 "Receivers are told to reject email that fails DMARC. This is the strongest setting.",
-                [], dp.messages))
+                [], dp.messages, key=f"policy-ok:{d}"))
 
         if dp.p in ("quarantine", "reject") and dp.pct < 100:
             findings.append(Finding(
@@ -399,13 +428,13 @@ def _policy_findings(policies: dict[str, DomainPolicy]) -> list[Finding]:
                 "messages and deliver the rest normally.",
                 [f"When reports look clean, raise pct to 100 in the {record_name} record "
                  "(or remove pct entirely; 100 is the default)."],
-                dp.messages))
+                dp.messages, key=f"pct:{d}"))
         if dp.testing == "y":
             findings.append(Finding(
                 "medium", f"{d}'s policy is in test mode (t=y)",
                 "Test mode tells receivers not to fully apply your policy.",
                 [f"Remove t=y from the {record_name} record when you're ready to enforce."],
-                dp.messages))
+                dp.messages, key=f"testing:{d}"))
         if dp.sp and POLICY_STRENGTH.get(dp.sp, 0) < POLICY_STRENGTH.get(dp.p, 0):
             findings.append(Finding(
                 "low", f"Subdomains of {d} are less protected",
@@ -413,7 +442,7 @@ def _policy_findings(policies: dict[str, DomainPolicy]) -> list[Finding]:
                 f"can spoof addresses like billing.{d}.",
                 [f"Set sp={dp.p} in the {record_name} record, or remove sp= so subdomains "
                  "inherit your main policy."],
-                0))
+                0, key=f"sp:{d}"))
     return findings
 
 
@@ -440,16 +469,28 @@ def _score(policies: dict[str, DomainPolicy]) -> tuple[int, str, str]:
 
 # ------------------------------------------------------------------------- main
 
-def analyze(reports: list[Report], domain: str | None = None,
-            hostnames: dict[str, str] | None = None) -> Analysis:
+def filter_reports(reports: list[Report], domain: str | None = None,
+                   since: datetime | None = None) -> list[Report]:
     if domain:
         reports = [r for r in reports if r.policy.domain == domain.lower()]
+    if since:
+        reports = [r for r in reports if r.end >= since]
+    return reports
+
+
+def analyze(reports: list[Report], domain: str | None = None,
+            hostnames: dict[str, str] | None = None,
+            labels: dict[str, tuple[str, str]] | None = None,
+            since: datetime | None = None) -> Analysis:
+    reports = filter_reports(reports, domain, since)
     hostnames = hostnames or {}
 
-    sources = sorted(_aggregate(reports, hostnames).values(), key=lambda s: -s.messages)
+    sources = sorted(_aggregate(reports, hostnames, labels).values(), key=lambda s: -s.messages)
     policies = _latest_policies(reports)
 
     for s in sources:
+        if s.category == "ignored":
+            continue
         legit = s.category not in ("unknown", "forwarded")
         for d, (msgs, passed) in s.by_domain.items():
             dp = policies.get(d)
@@ -471,11 +512,12 @@ def analyze(reports: list[Report], domain: str | None = None,
         findings.append(Finding(
             "good", "Everything looks healthy",
             "Your legitimate email is passing DMARC and nothing urgent needs attention.",
-            [], sum(s.messages for s in sources)))
+            [], sum(s.messages for s in sources), key="healthy"))
     findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], -f.affected))
 
-    total = sum(s.messages for s in sources)
-    passed = sum(s.dmarc_pass for s in sources)
+    counted = [s for s in sources if s.category != "ignored"]
+    total = sum(s.messages for s in counted)
+    passed = sum(s.dmarc_pass for s in counted)
     score, grade, label = _score(policies) if policies else (0, "–", "No data")
     reporters = Counter()
     for r in reports:
@@ -487,3 +529,30 @@ def analyze(reports: list[Report], domain: str | None = None,
         end=max((r.end for r in reports), default=None),
         reporters=reporters,
     )
+
+
+# ----------------------------------------------------------------------- trends
+
+def daily_series(reports: list[Report], domain: str | None = None,
+                 ips: set[str] | None = None,
+                 since: datetime | None = None) -> list[tuple[date, int, int]]:
+    """[(day, messages, passed)] for every day from the first to the last report.
+    Reports are bucketed by the day their period starts (UTC)."""
+    days: dict[date, list[int]] = defaultdict(lambda: [0, 0])
+    for r in filter_reports(reports, domain, since):
+        d = r.begin.date()
+        for rec in r.records:
+            if ips is not None and rec.source_ip not in ips:
+                continue
+            days[d][0] += rec.count
+            if rec.dmarc_pass:
+                days[d][1] += rec.count
+    if not days:
+        return []
+    first, last = min(days), max(days)
+    out, d = [], first
+    while d <= last:
+        msgs, passed = days.get(d, (0, 0))
+        out.append((d, msgs, passed))
+        d += timedelta(days=1)
+    return out

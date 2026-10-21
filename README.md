@@ -8,28 +8,49 @@ to fix first. Reports are read on your computer and never uploaded anywhere.
 
 ## What it does
 
-- Opens `.xml`, `.xml.gz`, `.zip` and `.eml` report files, or a whole folder at once (drag and drop works).
-- Gives your domain a health grade (A to F) based on how much legitimate mail passes and how strong your policy is.
-- Builds a prioritised **Action plan**: Critical, High, Medium, Low, plus what's going well, each with step-by-step fixes.
-- Recognises common services (Google, Microsoft 365, SendGrid, Mailchimp, Amazon SES, and more) and explains why each one passes or fails.
-- Exports a shareable HTML summary or a CSV of every sender.
-- Updates itself from GitHub Releases.
+- **Reads your reports**: `.xml`, `.xml.gz`, `.zip`, `.json` and `.eml` files, or whole folders (drag and drop works).
+- **Action plan**: problems ranked Critical, High, Medium, Low, with plain-English steps and links to each service's official setup guide. Mark items as done; they come back if newer reports show the problem is still happening.
+- **Health grade** (A to F) based on how much legitimate mail passes and how strong your policy is.
+- **Saved history**: every report is kept in a local database, so you only ever add new ones. Choose the period to look at (latest 7, 30 or 90 days, 12 months, or all time).
+- **Trends**: a daily chart of how much email passes DMARC, for all mail or for one sender.
+- **Senders**: who sends email as you, with known services recognised, the network owner and country of unknown servers (RDAP), and your own labels ("Office copier", "This is one of mine", "Ignore").
+- **Live DNS check**: your current DMARC, SPF, DKIM, MX and TLS reporting records, including the SPF 10-lookup limit, report-address authorization, weak DKIM keys and missing selectors.
+- **DMARC record builder**: writes the exact record for each rollout step and recommends the next one.
+- **TLS reports**: reads SMTP TLS reports (TLS-RPT) to show whether email sent to you arrives encrypted.
+- **Automatic import**: from an IMAP mailbox (Gmail/Google Workspace with an app password, Yahoo, iCloud, Fastmail, Zoho and others) or a watched folder.
+- **Alerts**: a notification when a new unknown sender appears, a working service starts failing, or the pass rate drops.
+- **Exports**: HTML summary, PDF summary, CSV of senders.
+- **Light and dark mode**, following Windows by default.
+- **Updates itself** from GitHub Releases.
+
+Reports are read on your computer and never uploaded anywhere. The DNS check (DNS over
+HTTPS via Cloudflare/Google) and the owner lookups (rdap.org) only send domain names and IP
+addresses, and both can be turned off in Settings.
 
 ## Project layout
 
 ```
-run.py                       Entry point
+run.py                       Entry point (--minimized starts in the system tray)
 xmlray/
-  parser.py                  Reads reports (xml / gz / zip / eml), safely
-  analyzer.py                Findings, priorities and health score
+  parser.py                  Reads reports (xml / gz / zip / eml / json), safely
+  tlsrpt.py                  SMTP TLS report parsing and analysis
+  analyzer.py                Findings, priorities, health score, trends
+  storage.py                 Saved history, labels, "done" marks, alerts (SQLite)
+  dnscheck.py                Live DNS health check
+  rdap.py                    Network owner and country lookups
+  mailimport.py              IMAP mailbox import and watched folder
+  alerts.py                  Change detection for alerts
+  recordbuilder.py           DMARC record builder logic
+  guides.py                  Links to each service's setup guide
   senders.py                 Known-service detection and reverse DNS
   updater.py                 GitHub Releases update check, download, SHA-256 verify
-  export.py                  HTML summary and CSV export
-  ui/                        PySide6 interface
-  assets/                    Icon and sample report
+  export.py                  HTML, PDF (print layout) and CSV export
+  ui/                        PySide6 interface (themes, charts, dialogs)
+  assets/                    Icon and sample reports
 builder/release_manager.py   GUI that builds the installer and publishes releases
-packaging/XML-ray.spec       PyInstaller recipe
-packaging/installer.iss      Inno Setup installer script
+builder/github_sync.py       Uploads source code to GitHub without Git
+tools/make_samples.py        Regenerates the two-week sample data
+packaging/                   PyInstaller recipe and Inno Setup installer script
 tests/                       pytest tests
 ```
 
@@ -52,7 +73,7 @@ tests/                       pytest tests
 5. Create a GitHub token: Settings → Developer settings → Fine-grained tokens → limit it to the
    `XML-ray` repository → Repository permissions → **Contents: Read and write**.
 
-Try the app with **Run XML-ray.bat**, then click **Try a sample report**.
+Try the app with **Run XML-ray.bat**, then click **Try sample reports**.
 
 ## Releasing an update
 
@@ -102,3 +123,10 @@ turn off start-up checks under *Settings*.
   `signtool` (Inno Setup's `SignTool=` directive can do this during the build).
 - **Reverse DNS** lookups name the sending servers. Turn them off under *Settings* if your network blocks them.
 - Run tests with `python -m pytest tests`.
+
+## Where XML-ray keeps its data
+
+Saved reports, sender labels, "done" marks and alerts are in
+`%LOCALAPPDATA%\XML-ray\history.db`. Settings are in the Windows registry under
+`HKEY_CURRENT_USER\Software\XML-ray`. A mailbox password is stored in Windows Credential
+Manager, never in a file. Uninstalling leaves the history in place, so reinstalling keeps it.

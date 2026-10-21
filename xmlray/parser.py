@@ -1,7 +1,8 @@
 """Read DMARC aggregate (RUA) reports.
 
 Accepts plain .xml, gzip (.gz / .xml.gz), .zip archives, .eml emails that carry a
-report as an attachment, and whole folders of any of those. Reports come from
+report as an attachment, and whole folders of any of those. SMTP TLS reports (TLS-RPT,
+JSON) found in the same places are handed to xmlray.tlsrpt. Reports come from
 outside your organisation, so XML is parsed with defusedxml when it's installed
 and every decompression step is size-limited.
 """
@@ -23,7 +24,7 @@ except ImportError:  # pragma: no cover
     import xml.etree.ElementTree as ET  # type: ignore
 
 MAX_REPORT_BYTES = 200 * 1024 * 1024  # 200 MB per decompressed report
-SUPPORTED_SUFFIXES = {".xml", ".gz", ".gzip", ".zip", ".eml"}
+SUPPORTED_SUFFIXES = {".xml", ".gz", ".gzip", ".zip", ".eml", ".json"}
 FORWARD_REASONS = {"forwarded", "mailing_list", "trusted_forwarder"}
 
 
@@ -84,6 +85,7 @@ class Report:
     policy: PolicyPublished
     records: list[Record]
     source_file: str = ""
+    raw: bytes = field(default=b"", repr=False)
 
     @property
     def total_messages(self) -> int:
@@ -207,6 +209,7 @@ def parse_report_bytes(data: bytes, source: str = "") -> Report:
         policy=policy,
         records=records,
         source_file=source,
+        raw=data,
     )
 
 
@@ -238,9 +241,10 @@ def _from_email(data: bytes, label: str) -> Iterator[tuple[str, bytes]]:
             continue
         name = part.get_filename() or ""
         ctype = part.get_content_type()
-        if name.lower().endswith((".xml", ".gz", ".zip")) or ctype in (
+        if name.lower().endswith((".xml", ".gz", ".zip", ".json")) or ctype in (
             "application/zip", "application/gzip", "application/x-gzip",
-            "text/xml", "application/xml",
+            "text/xml", "application/xml", "application/tlsrpt+gzip",
+            "application/tlsrpt+json", "application/json",
         ):
             payload = part.get_payload(decode=True)
             if payload:
@@ -274,20 +278,56 @@ def _expand(paths: Iterable[str | Path]) -> list[Path]:
     return files
 
 
-def load_paths(paths: Iterable[str | Path]) -> tuple[list[Report], list[str]]:
-    """Load every report found in *paths*. Returns (reports, human-readable errors)."""
-    reports: list[Report] = []
-    errors: list[str] = []
+@dataclass
+class LoadResult:
+    dmarc: list = field(default_factory=list)
+    tls: list = field(default_factory=list)
+    errors: list = field(default_factory=list)
+
+
+def parse_any(data: bytes, label: str, result: LoadResult) -> None:
+    """Parse one unwrapped report (DMARC XML or TLS-RPT JSON) into *result*."""
+    from .tlsrpt import parse_tls_bytes  # local import avoids a cycle
+    try:
+        if data.lstrip()[:1] == b"{":
+            result.tls.append(parse_tls_bytes(data, source=label))
+        else:
+            result.dmarc.append(parse_report_bytes(data, source=label))
+    except ReportParseError as exc:
+        result.errors.append(f"{label}: {exc}")
+
+
+def load_bytes(data: bytes, label: str, result: LoadResult | None = None) -> LoadResult:
+    """Load every report inside one file's bytes (any wrapper)."""
+    result = result or LoadResult()
+    try:
+        for inner_label, inner in _unpack(data, label):
+            parse_any(inner, inner_label, result)
+    except (ReportParseError, OSError, zipfile.BadZipFile, EOFError, gzip.BadGzipFile) as exc:
+        result.errors.append(f"{label}: {exc}")
+    return result
+
+
+def load_all(paths: Iterable[str | Path]) -> LoadResult:
+    """Load every DMARC and TLS report found in *paths*."""
+    from .tlsrpt import dedupe_tls
+    result = LoadResult()
     for f in _expand(paths):
         try:
-            for label, xml_bytes in _unpack(f.read_bytes(), f.name):
-                try:
-                    reports.append(parse_report_bytes(xml_bytes, source=label))
-                except ReportParseError as exc:
-                    errors.append(f"{label}: {exc}")
-        except (ReportParseError, OSError, zipfile.BadZipFile, EOFError, gzip.BadGzipFile) as exc:
-            errors.append(f"{f.name}: {exc}")
-    return dedupe(reports), errors
+            data = f.read_bytes()
+        except OSError as exc:
+            result.errors.append(f"{f.name}: {exc}")
+            continue
+        load_bytes(data, f.name, result)
+    result.dmarc = dedupe(result.dmarc)
+    result.tls = dedupe_tls(result.tls)
+    return result
+
+
+def load_paths(paths: Iterable[str | Path]) -> tuple[list[Report], list[str]]:
+    """Load DMARC reports only. Returns (reports, human-readable errors)."""
+    r = load_all(paths)
+    return r.dmarc, r.errors
 
 
 def dedupe(reports: Iterable[Report]) -> list[Report]:
