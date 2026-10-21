@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec.bak
+.venv/
+venv/
+.idea/
+.vscode/
+.builder_sync.json
+_sync_backup/
