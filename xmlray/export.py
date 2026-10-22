@@ -172,3 +172,35 @@ def senders_csv(a: Analysis, path: str, owners: dict | None = None) -> None:
                         s.delivered_summary, "; ".join(s.header_from),
                         f"{s.first_seen:%Y-%m-%d}" if s.first_seen else "",
                         f"{s.last_seen:%Y-%m-%d}" if s.last_seen else "", s.meaning])
+
+
+def json_summary(a: Analysis, findings=None, dns_results=None, tls=None, owners=None) -> dict:
+    """Everything XML-ray knows, as plain JSON for dashboards and other tools."""
+    findings = a.findings if findings is None else findings
+    owners = owners or {}
+    return {
+        "generator": f"{APP_NAME} {__version__}",
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "period": {"from": a.begin.isoformat() if a.begin else None,
+                   "to": a.end.isoformat() if a.end else None},
+        "grade": a.grade, "score": a.score, "messages": a.total, "passed": a.passed,
+        "pass_percent": round(a.pass_pct, 2),
+        "policies": {d: {"p": p.p, "sp": p.sp, "pct": p.pct,
+                         "legit_pass_percent": round(p.legit_pass_rate * 100, 2)}
+                     for d, p in a.policies.items()},
+        "findings": [{"severity": f.severity, "title": f.title, "summary": f.summary,
+                      "steps": f.steps, "key": f.key, "source": f.source,
+                      "affected": f.affected, "ips": f.ips} for f in findings],
+        "senders": [{"ip": s.ip, "name": s.name, "hostname": s.hostname,
+                     "owner": owners.get(s.ip, ""), "status": s.category_label,
+                     "messages": s.messages, "passed": s.dmarc_pass,
+                     "spf_aligned": s.spf_aligned, "dkim_aligned": s.dkim_aligned,
+                     "from_domains": dict(s.header_from),
+                     "first_seen": s.first_seen.isoformat() if s.first_seen else None,
+                     "last_seen": s.last_seen.isoformat() if s.last_seen else None}
+                    for s in a.sources],
+        "dns": {d: [{"kind": v.kind, "name": v.name, "value": v.value, "status": v.status,
+                     "note": v.note} for v in r.records] for d, r in (dns_results or {}).items()},
+        "tls": {"connections": tls.total, "success_percent": round(tls.success_pct, 2),
+                "failures": dict(tls.by_type)} if tls and tls.total else None,
+    }

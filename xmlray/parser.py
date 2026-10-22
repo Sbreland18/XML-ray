@@ -261,9 +261,17 @@ def _unpack(data: bytes, label: str) -> Iterator[tuple[str, bytes]]:
     elif data[:4] == b"PK\x03\x04":
         yield from _unzip(data, label)
     elif label.lower().endswith(".eml") or data.lstrip()[:5].lower() in (b"from:", b"recei", b"retur", b"mime-", b"deliv"):
-        yield from _from_email(data, label)
+        if _is_failure_report(data):
+            yield label, data            # a failure report is itself the report
+        else:
+            yield from _from_email(data, label)
     else:
         yield label, data
+
+
+def _is_failure_report(data: bytes) -> bool:
+    head = data[:8192].lower()
+    return b"multipart/report" in head and b"feedback-report" in head
 
 
 def _expand(paths: Iterable[str | Path]) -> list[Path]:
@@ -283,13 +291,20 @@ class LoadResult:
     dmarc: list = field(default_factory=list)
     tls: list = field(default_factory=list)
     errors: list = field(default_factory=list)
+    forensic: list = field(default_factory=list)
 
 
 def parse_any(data: bytes, label: str, result: LoadResult) -> None:
     """Parse one unwrapped report (DMARC XML or TLS-RPT JSON) into *result*."""
+    from .forensic import parse_forensic
     from .tlsrpt import parse_tls_bytes  # local import avoids a cycle
     try:
-        if data.lstrip()[:1] == b"{":
+        if _is_failure_report(data):
+            fr = parse_forensic(data, label)
+            if fr is None:
+                raise ReportParseError("unreadable DMARC failure report")
+            result.forensic.append(fr)
+        elif data.lstrip()[:1] == b"{":
             result.tls.append(parse_tls_bytes(data, source=label))
         else:
             result.dmarc.append(parse_report_bytes(data, source=label))
@@ -310,6 +325,7 @@ def load_bytes(data: bytes, label: str, result: LoadResult | None = None) -> Loa
 
 def load_all(paths: Iterable[str | Path]) -> LoadResult:
     """Load every DMARC and TLS report found in *paths*."""
+    from .forensic import dedupe_forensic
     from .tlsrpt import dedupe_tls
     result = LoadResult()
     for f in _expand(paths):
@@ -321,6 +337,7 @@ def load_all(paths: Iterable[str | Path]) -> LoadResult:
         load_bytes(data, f.name, result)
     result.dmarc = dedupe(result.dmarc)
     result.tls = dedupe_tls(result.tls)
+    result.forensic = dedupe_forensic(result.forensic)
     return result
 
 

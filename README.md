@@ -8,6 +8,14 @@ to fix first. Reports are read on your computer and never uploaded anywhere. Blo
 through your own network's DNS server; some lists refuse queries from large public DNS
 services, which XML-ray shows as "Couldn't check" rather than "Clear".
 
+Certificate checks connect to your mail servers on port 25. Many home and office networks
+block that port; XML-ray then shows "Couldn't check" for those servers.
+
+**About the "25% to spam" step:** the updated DMARC standard (RFC 9989, May 2026) no longer
+includes the `pct` tag, so receivers that follow it may treat `p=quarantine; pct=25` as
+quarantining all failing mail. XML-ray warns about this; only take that step when none of
+your own services are failing.
+
 ## What it does
 
 - **Reads your reports**: `.xml`, `.xml.gz`, `.zip`, `.json` and `.eml` files, or whole folders (drag and drop works).
@@ -29,13 +37,31 @@ services, which XML-ray shows as "Couldn't check" rather than "Clear".
 - **Lookalike domain watch**: finds registered misspellings and look-alike domains of yours and flags new ones that can send email.
 - **Weekly summary email** to you or a manager.
 - **Report drill-down**: double-click any report to see every row and the original file.
-- **Exports**: HTML summary, PDF summary, CSV of senders.
+- **Setup wizard** for new users: checks the domain, creates the DMARC record if missing, and connects a mailbox or folder.
+- **"Add a new email service" wizard**: pick the service (Mailchimp, SendGrid, Google Workspace and 20 more) and get the exact DKIM/SPF steps; XML-ray confirms from the reports once it passes.
+- **DNS change alerts**: notices when someone edits your SPF, DMARC, DKIM, MX or MTA-STS records, with a change history.
+- **Bulk sender rules**: Gmail, Yahoo and Outlook.com requirements (SPF, DKIM, DMARC, alignment, reverse DNS, TLS, spam rate, one-click unsubscribe) as a pass/fail checklist.
+- **Multiple organizations**: separate reports, settings, mailbox and weekly summary per client, an overview of all of them, and background imports for every organization.
+- **"Sent as" breakdown**: which domains and subdomains send email and whether each passes.
+- **Certificate expiry warnings** for your mail servers (STARTTLS) and MTA-STS website.
+- **DMARC failure (forensic) reports**, shown per sender and in the Reports tab.
+- **Gmail Postmaster Tools** (API v2): Gmail's own spam rate and authentication figures. Needs a free Google Cloud OAuth client (Desktop app); see Settings > Gmail Postmaster.
+- **Scheduled exports**: JSON and CSV files written daily or weekly for dashboards and scripts.
+- **Exports**: HTML summary, PDF summary, CSV of senders, JSON of everything.
 - **Light and dark mode**, following Windows by default.
 - **Updates itself** from GitHub Releases.
 
 Reports are read on your computer and never uploaded anywhere. Blocklists are queried
 through your own network's DNS server; some lists refuse queries from large public DNS
-services, which XML-ray shows as "Couldn't check" rather than "Clear". The DNS check (DNS over
+services, which XML-ray shows as "Couldn't check" rather than "Clear".
+
+Certificate checks connect to your mail servers on port 25. Many home and office networks
+block that port; XML-ray then shows "Couldn't check" for those servers.
+
+**About the "25% to spam" step:** the updated DMARC standard (RFC 9989, May 2026) no longer
+includes the `pct` tag, so receivers that follow it may treat `p=quarantine; pct=25` as
+quarantining all failing mail. XML-ray warns about this; only take that step when none of
+your own services are failing. The DNS check (DNS over
 HTTPS via Cloudflare/Google) and the owner lookups (rdap.org) only send domain names and IP
 addresses, and both can be turned off in Settings.
 
@@ -58,6 +84,13 @@ xmlray/
   lookalike.py               Lookalike domain watch
   mailsend.py                Weekly summary email (SMTP)
   logs.py                    Error log and diagnostics
+  profiles.py                Multiple organizations (separate data and settings)
+  services.py                Catalog for the "Add a new email service" wizard
+  senderreqs.py              Gmail / Yahoo / Outlook.com bulk sender checklist
+  dnswatch.py                DNS change tracking
+  certcheck.py               Mail server and MTA-STS certificate checks
+  forensic.py                DMARC failure (forensic) reports
+  postmaster.py              Gmail Postmaster Tools API v2 and desktop sign-in
   recordbuilder.py           DMARC record builder logic
   guides.py                  Links to each service's setup guide
   senders.py                 Known-service detection and reverse DNS
@@ -153,7 +186,7 @@ turn off start-up checks under *Settings*.
 ## Where XML-ray keeps its data
 
 Saved reports, sender labels, "done" marks and alerts are in
-`%LOCALAPPDATA%\XML-ray\history.db`. Settings are in the Windows registry under
+`%LOCALAPPDATA%\XML-ray\history.db` (extra organizations: `%LOCALAPPDATA%\XML-ray\profiles\`). Settings are in the Windows registry under
 `HKEY_CURRENT_USER\Software\XML-ray`. A mailbox password is stored in Windows Credential
 Manager, never in a file. Uninstalling leaves the history in place, so reinstalling keeps it.
 

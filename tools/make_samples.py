@@ -60,6 +60,44 @@ def tls(day, failures):
     return json.dumps(doc, indent=1).encode()
 
 
+FAILURE_REPORT = """From: DMARC Reports <dmarc-noreply@reports.example.net>
+To: dmarc-failures@example.com
+Subject: Report Domain: example.com Failure report
+Date: Tue, 13 Oct 2026 09:14:02 +0000
+Message-ID: <ruf-20261013-0001@reports.example.net>
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=feedback-report; boundary="b1"
+
+--b1
+Content-Type: text/plain
+
+This is a DMARC failure report for example.com.
+
+--b1
+Content-Type: message/feedback-report
+
+Feedback-Type: auth-failure
+User-Agent: ExampleReporter/1.0
+Version: 1
+Original-Mail-From: <billing@example.com>
+Arrival-Date: Tue, 13 Oct 2026 09:13:58 +0000
+Source-IP: 203.0.113.45
+Reported-Domain: example.com
+Auth-Failure: dmarc
+Authentication-Results: mx.reports.example.net; dmarc=fail header.from=example.com; spf=fail smtp.mailfrom=example.com
+
+--b1
+Content-Type: text/rfc822-headers
+
+From: "Example Billing" <billing@example.com>
+To: [redacted]
+Subject: Your invoice is overdue - pay now
+Date: Tue, 13 Oct 2026 09:13:50 +0000
+
+--b1--
+"""
+
+
 def main():
     rnd = random.Random(7)
     buf = io.BytesIO()
@@ -94,6 +132,7 @@ def main():
                 z.writestr(name.replace(" ", "_"), gzip.compress(dmarc(org, email, rid, day, recs)))
             fails = [("certificate-expired", 6 - day)] if day < 5 else []
             z.writestr(f"google.com!{DOMAIN}!2026-10-{day + 1:02d}.json.gz", gzip.compress(tls(day, fails)))
+        z.writestr("dmarc-failure-report.eml", FAILURE_REPORT)
     OUT.write_bytes(buf.getvalue())
     print("wrote", OUT, len(buf.getvalue()), "bytes")
 

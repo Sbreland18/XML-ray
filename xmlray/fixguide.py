@@ -255,6 +255,10 @@ def _dmarc_plan(f, d: str, ctx: FixContext, stage: str | None = None) -> FixPlan
     if "pct=25" in proposed:
         plan.notes.append("After two weeks of clean reports, come back here: XML-ray will "
                           "suggest the next step (all failing mail to spam).")
+        plan.notes.append("Important: the updated DMARC standard (RFC 9989, May 2026) no longer "
+                          "includes pct, so receivers that follow it may send all failing mail "
+                          "to spam, not just 25%. Only take this step when none of your own "
+                          "services are failing.")
     return plan
 
 
@@ -597,6 +601,10 @@ def verify_changes(plan: FixPlan, resolver) -> tuple[list[CheckResult], int]:
     """Look each change up in live DNS. Returns (results, longest TTL seen)."""
     out, ttl = [], 0
     for c in plan.changes:
+        if "<" in c.host:
+            out.append(CheckResult(c, True, "Check this one in the service's own settings "
+                                            "(XML-ray doesn't know its exact name)."))
+            continue
         try:
             if c.rtype == "MX":
                 values = resolver.mx(c.host)
@@ -632,3 +640,56 @@ def verify_changes(plan: FixPlan, resolver) -> tuple[list[CheckResult], int]:
         out.append(CheckResult(c, ok, msg))
     return out, ttl
 
+
+
+# ========================================================== new service
+
+def service_plan(service, domain: str, dns) -> FixPlan:
+    """Steps to set up a new email service for *domain* (from services.CATALOG)."""
+    name = service.name if service.name != "Other service" else "the service"
+    plan = FixPlan(
+        f"Set up {name} to send email for {domain}",
+        f"So that email {name} sends using {domain} passes DMARC, it must sign with your "
+        "domain (DKIM). Do this before sending, so nothing gets blocked or junked.",
+        domain, verify_key="")
+    plan.changes.append(RecordChange(
+        "from_provider", f"<selector>._domainkey.{domain}", "CNAME or TXT", "",
+        f"Copy each record exactly as {name} shows it (usually two or three CNAME records).",
+        f"Find them in {name}: {service.where}." if service.where else
+        f"Look in {name}'s settings for “domain authentication”, “sender authentication” or "
+        "“DKIM”.", exact=False))
+    include = service.spf_include
+    if service.spf == "required":
+        current = dns.spf_record if dns else ""
+        if include and current and f"include:{include}" in current.lower():
+            plan.notes.append(f"Your SPF record already includes {name}.")
+        elif include:
+            if current:
+                terms = current.split()
+                pos = next((i for i, t in enumerate(terms) if t.lstrip("+-~?").lower() == "all"
+                            or t.lower().startswith("redirect=")), len(terms))
+                proposed = " ".join(terms[:pos] + [f"include:{include}"] + terms[pos:])
+                est = (dns.spf_lookups if dns else 0) + 1
+                note = (f"About {est} of 10 DNS lookups afterwards (the include can add a few "
+                        "more; run the DNS check after saving).")
+            else:
+                proposed, note = f"v=spf1 include:{include} ~all", ""
+            plan.changes.append(RecordChange("change" if current else "add", domain, "TXT",
+                                             current, proposed, note))
+        else:
+            plan.steps.append(f"Add the SPF include: value from {name}'s setup guide to your "
+                              "SPF record.")
+    elif include:
+        plan.notes.append(f"SPF isn't needed for {name}: it uses its own bounce address, and "
+                          "DKIM alone passes DMARC. Only add include:" + include +
+                          f" if you set up a custom return-path (bounce) domain in {name}.")
+    plan.steps = [
+        f"In {name}, add {domain} as a sending domain and start domain authentication.",
+        f"Add the records {name} shows at your DNS host, as described above, exactly as shown.",
+        f"Back in {name}, click Verify (or Authenticate). It can take up to an hour to confirm.",
+    ] + plan.steps
+    if service.provider or service.name != "Other service":
+        plan.steps.append(guide_step(service.provider or service.name))
+    plan.notes.append(f"XML-ray will confirm from your reports, within a day or two of "
+                      f"{name} sending mail, that it passes.")
+    return plan

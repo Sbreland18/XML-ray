@@ -5,7 +5,8 @@ from dataclasses import dataclass
 
 STAGES = [  # (key, label, p, pct)
     ("monitor", "Monitor only (p=none)", "none", 100),
-    ("q25", "Start enforcing: 25% to spam (p=quarantine; pct=25)", "quarantine", 25),
+    ("q25", "Start enforcing: 25% to spam (p=quarantine; pct=25; newer receivers may apply 100%)",
+     "quarantine", 25),
     ("q100", "All failing mail to spam (p=quarantine)", "quarantine", 100),
     ("reject", "Block failing mail (p=reject)", "reject", 100),
 ]

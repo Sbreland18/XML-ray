@@ -556,3 +556,36 @@ def daily_series(reports: list[Report], domain: str | None = None,
         out.append((d, msgs, passed))
         d += timedelta(days=1)
     return out
+
+
+# ------------------------------------------------------------ From domains
+
+def from_domain_stats(reports: list[Report], domain: str | None = None,
+                      since: datetime | None = None) -> dict[str, dict]:
+    """{header_from domain: {messages, passed, ips}} - which (sub)domains send as you."""
+    out: dict[str, dict] = {}
+    for r in filter_reports(reports, domain, since):
+        for rec in r.records:
+            d = out.setdefault(rec.header_from or r.policy.domain,
+                               {"messages": 0, "passed": 0, "ips": set()})
+            d["messages"] += rec.count
+            d["passed"] += rec.count if rec.dmarc_pass else 0
+            d["ips"].add(rec.source_ip)
+    return out
+
+
+def subdomain_findings(stats: dict[str, dict], policies: dict) -> list[Finding]:
+    out = []
+    for name, st in sorted(stats.items()):
+        if name in policies or st["messages"] < 10:
+            continue                             # the main domain is covered elsewhere
+        rate = st["passed"] / st["messages"]
+        if rate < 0.9:
+            out.append(Finding(
+                "medium", f"Email sent as {name} is failing DMARC",
+                f"{st['messages'] - st['passed']:,} of {st['messages']:,} messages using the "
+                f"subdomain {name} failed. Subdomains need their own SPF and DKIM set up.",
+                [f"Find which service sends as {name} (Senders tab, “Sent as” filter) and set "
+                 "up its SPF and DKIM for that subdomain."], st["messages"] - st["passed"],
+                sorted(st["ips"]), key=f"subdomain:{name}"))
+    return out

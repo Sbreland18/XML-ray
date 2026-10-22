@@ -191,6 +191,9 @@ class ReportDialog(QDialog):
         super().__init__(parent)
         tls = hasattr(report, "policies")
         self.report = report
+        if hasattr(report, "auth_failure"):
+            self._forensic(report)
+            return
         self.setWindowTitle(f"{'TLS' if tls else 'DMARC'} report from {report.org_name}")
         self.resize(980, 640)
         lay = QVBoxLayout(self)
@@ -253,6 +256,33 @@ class ReportDialog(QDialog):
         close.clicked.connect(self.accept)
         row.addWidget(close)
         lay.addLayout(row)
+
+    def _forensic(self, r) -> None:
+        self.setWindowTitle(f"DMARC failure report from {r.reporter}")
+        self.resize(820, 600)
+        lay = QVBoxLayout(self)
+        note = QLabel("One message that failed DMARC, as the receiving server saw it. Providers "
+                      "usually remove personal details before sending these.", objectName="Muted")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        form = QFormLayout()
+        for label, val in (("Reported by", r.reporter), ("Arrived", f"{r.arrival:%Y-%m-%d %H:%M} UTC"),
+                           ("Sending server", r.source_ip), ("What failed", r.auth_failure.upper()),
+                           ("Domain", r.reported_domain), ("From", r.original_from),
+                           ("Envelope sender", r.original_mail_from), ("Subject", r.subject),
+                           ("DKIM", f"{r.dkim_domain} ({r.dkim_selector})" if r.dkim_domain else ""),
+                           ("Authentication results", r.auth_results)):
+            lab = QLabel(val or "(not included)")
+            lab.setWordWrap(True)
+            lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            form.addRow(label, lab)
+        lay.addLayout(form)
+        raw = QPlainTextEdit((r.raw or b"").decode("utf-8", "replace"))
+        raw.setReadOnly(True)
+        lay.addWidget(raw, 1)
+        close = QPushButton("Close", objectName="Primary")
+        close.clicked.connect(self.accept)
+        lay.addWidget(close, 0, Qt.AlignRight)
 
     def _pretty(self) -> str:
         raw = self.report.raw or b""

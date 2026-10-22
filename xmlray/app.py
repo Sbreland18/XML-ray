@@ -1,7 +1,7 @@
 """Application entry point."""
 import sys
 
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QSettings, QTimer
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
@@ -10,6 +10,19 @@ from .__version__ import __version__
 from .config import APP_NAME, ORG_NAME, asset
 from .ui import style
 from .ui.main_window import MainWindow
+
+_windows: list = []
+
+
+def open_window(start_hidden: bool = False, files=None) -> MainWindow:
+    """Open the main window for the active organization. Switching organization closes the
+    current window and calls this again."""
+    window = MainWindow(start_hidden=start_hidden)
+    window.reopen.connect(lambda: QTimer.singleShot(0, open_window))
+    _windows[:] = [window]
+    if files:
+        window.load(files)
+    return window
 
 
 def main() -> None:
@@ -34,10 +47,8 @@ def main() -> None:
 
     minimized = "--minimized" in sys.argv
     hide = minimized and settings.value("tray/enabled", False, type=bool)
-    window = MainWindow(start_hidden=hide)
+    files = [a for a in sys.argv[1:] if not a.startswith("-")]
+    window = open_window(start_hidden=hide, files=files)
     if minimized and not hide:
         window.showMinimized()
-    files = [a for a in sys.argv[1:] if not a.startswith("-")]
-    if files:  # e.g. files dropped onto the XML-ray shortcut
-        window.load(files)
     sys.exit(app.exec())

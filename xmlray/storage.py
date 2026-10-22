@@ -70,8 +70,9 @@ class Storage:
 
     # ------------------------------------------------------------------ reports
 
-    def add_reports(self, dmarc=(), tls=()) -> tuple[list, list]:
-        """Save reports not already stored. Returns (new_dmarc, new_tls)."""
+    def add_reports(self, dmarc=(), tls=(), forensic=None) -> tuple[list, list]:
+        """Save reports not already stored. Returns (new_dmarc, new_tls). New failure
+        (forensic) reports are appended to the *forensic* list if one is given."""
         new_d, new_t = [], []
         now = time.time()
         with self._db() as c:
@@ -91,6 +92,14 @@ class Storage:
                      r.end.timestamp(), r.source_file, now, zlib.compress(r.raw or b"")))
                 if cur.rowcount:
                     new_t.append(r)
+            for r in list(forensic or []):
+                key = "ruf|" + "|".join(r.key)
+                cur = c.execute(
+                    "INSERT OR IGNORE INTO reports VALUES (?,?,?,?,?,?,?,?,?)",
+                    ("ruf", key, r.reporter, r.reported_domain, r.arrival.timestamp(),
+                     r.arrival.timestamp(), r.source_file, now, zlib.compress(r.raw or b"")))
+                if not cur.rowcount:
+                    forensic.remove(r)          # already saved: not new
         return new_d, new_t
 
     def iter_raw(self) -> Iterator[tuple[str, bytes, str]]:

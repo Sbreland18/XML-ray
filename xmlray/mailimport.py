@@ -113,7 +113,8 @@ def fetch_reports(cfg: MailboxConfig, password: str, storage, progress=None) -> 
         typ, data = conn.response("UIDVALIDITY")
         validity = (data[0].decode() if data and data[0] else "0")
         since = (datetime.now() - timedelta(days=max(cfg.days, 1))).strftime("%d-%b-%Y")
-        typ, data = conn.uid("SEARCH", None, "SINCE", since, "SUBJECT", "Report")
+        typ, data = conn.uid("SEARCH", None, "SINCE", since, "OR", "SUBJECT", "Report",
+                             "SUBJECT", "Failure")
         if typ != "OK":
             raise MailboxError("The mail server couldn't search this folder.")
         uids = data[0].split() if data and data[0] else []
@@ -127,6 +128,7 @@ def fetch_reports(cfg: MailboxConfig, password: str, storage, progress=None) -> 
                 sub = load_bytes(msg[0][1], f"email {keys[k].decode()}.eml")
                 result.dmarc += sub.dmarc
                 result.tls += sub.tls      # emails that aren't reports are simply skipped
+                result.forensic += sub.forensic
             if progress:
                 progress(i, len(new))
         storage.mark_seen(new)

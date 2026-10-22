@@ -12,7 +12,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import mailimport, mailsend, recordbuilder, winstartup
+from .. import mailimport, mailsend, postmaster, recordbuilder, winstartup
+from .tasks import Task, start
 from ..updater import ReleaseInfo
 
 GLOSSARY_HTML = """
@@ -143,7 +144,8 @@ def _hint(text: str) -> QLabel:
 class SettingsDialog(QDialog):
     """All preferences. Reads and writes QSettings; the caller re-reads them afterwards."""
 
-    TAB_GENERAL, TAB_MAILBOX, TAB_FOLDER, TAB_DOMAINS, TAB_SUMMARY, TAB_ALERTS = range(6)
+    (TAB_GENERAL, TAB_MAILBOX, TAB_FOLDER, TAB_DOMAINS, TAB_SUMMARY, TAB_EXPORTS, TAB_POSTMASTER,
+     TAB_ALERTS) = range(8)
 
     def __init__(self, settings: QSettings, parent=None, start_tab: int = 0, storage=None,
                  send_test=None):
@@ -152,7 +154,7 @@ class SettingsDialog(QDialog):
         self.storage = storage
         self.send_test = send_test
         self.setWindowTitle("Settings")
-        self.resize(640, 600)
+        self.resize(700, 620)
         lay = QVBoxLayout(self)
         self.tabs = QTabWidget()
         self.tabs.addTab(self._general(), "General")
@@ -160,6 +162,8 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(self._folder(), "Watched folder")
         self.tabs.addTab(self._domains(), "Domains")
         self.tabs.addTab(self._summary(), "Summary email")
+        self.tabs.addTab(self._exports(), "Exports")
+        self.tabs.addTab(self._postmaster(), "Gmail Postmaster")
         self.tabs.addTab(self._alerts(), "Alerts")
         self.tabs.setCurrentIndex(start_tab)
         lay.addWidget(self.tabs, 1)
@@ -194,11 +198,14 @@ class SettingsDialog(QDialog):
         self.dns.setChecked(self._val("lookup/dns", True, bool))
         self.blocklists = QCheckBox("Check my sending servers against spam blocklists")
         self.blocklists.setChecked(self._val("lookup/blocklist", True, bool))
+        self.certs = QCheckBox("Check my mail servers' certificates once a day")
+        self.certs.setChecked(self._val("lookup/certs", True, bool))
         self.lookalikes = QCheckBox("Look for lookalike domains once a week")
         self.lookalikes.setChecked(self._val("lookup/lookalike", True, bool))
         self.updates = QCheckBox("Check for XML-ray updates when it starts")
         self.updates.setChecked(self._val("updates/check_on_startup", True, bool))
-        for cb in (self.rdns, self.rdap, self.dns, self.blocklists, self.lookalikes, self.updates):
+        for cb in (self.rdns, self.rdap, self.dns, self.blocklists, self.certs, self.lookalikes,
+                   self.updates):
             f.addRow("", cb)
         self.tray = QCheckBox("Keep running in the system tray when I close the window")
         self.tray.setChecked(self._val("tray/enabled", False, bool))
@@ -437,6 +444,116 @@ class SettingsDialog(QDialog):
         QApplication.restoreOverrideCursor()
         QMessageBox.information(self, "Sent", f"A test summary was sent to {cfg.to}.")
 
+    def _exports(self) -> QWidget:
+        w = QWidget(objectName="TabHost")
+        v = QVBoxLayout(w)
+        self.exp_on = QCheckBox("Save an export automatically")
+        self.exp_on.setChecked(self._val("export/enabled", False, bool))
+        v.addWidget(self.exp_on)
+        f = QFormLayout()
+        row = QHBoxLayout()
+        self.exp_path = QLineEdit(self._val("export/path", ""))
+        browse = QPushButton("Browse")
+        browse.clicked.connect(lambda: self.exp_path.setText(
+            QFileDialog.getExistingDirectory(self, "Export folder", self.exp_path.text())
+            or self.exp_path.text()))
+        row.addWidget(self.exp_path, 1)
+        row.addWidget(browse)
+        f.addRow("Folder", row)
+        self.exp_json = QCheckBox("JSON (everything: grade, findings, senders, DNS)")
+        self.exp_json.setChecked(self._val("export/json", True, bool))
+        self.exp_csv = QCheckBox("CSV (senders, opens in Excel)")
+        self.exp_csv.setChecked(self._val("export/csv", False, bool))
+        f.addRow("Formats", self.exp_json)
+        f.addRow("", self.exp_csv)
+        self.exp_freq = QComboBox()
+        self.exp_freq.addItem("Every day", 1)
+        self.exp_freq.addItem("Every week", 7)
+        self.exp_freq.setCurrentIndex(max(self.exp_freq.findData(self._val("export/days", 1, int)), 0))
+        f.addRow("How often", self.exp_freq)
+        v.addLayout(f)
+        v.addWidget(_hint("Each export is saved with the date in its name, plus a "
+                          "“latest” copy that's overwritten, which suits dashboards and "
+                          "scripts that read the same file every time."))
+        v.addStretch(1)
+        return w
+
+    def _postmaster(self) -> QWidget:
+        w = QWidget(objectName="TabHost")
+        v = QVBoxLayout(w)
+        v.addWidget(_hint(
+            "Gmail Postmaster Tools shows Gmail's own view of your mail: spam complaint rate, "
+            "authentication and delivery errors. It's free, but Google requires a one-time "
+            "setup:<ol><li>Add and verify your domain at "
+            "<a href='https://postmaster.google.com'>postmaster.google.com</a>.</li>"
+            "<li>In <a href='https://console.cloud.google.com'>Google Cloud console</a>, create "
+            "a project, enable the <b>Gmail Postmaster Tools API</b>, and create an OAuth client "
+            "ID of type <b>Desktop app</b>.</li><li>Download its JSON file and choose it below, "
+            "then click Connect.</li></ol>Gmail only shows statistics for domains that send "
+            "enough mail to personal Gmail addresses."))
+        row = QHBoxLayout()
+        self.pm_file = QLineEdit(self._val("postmaster/client_file", ""))
+        self.pm_file.setPlaceholderText("client_secret_….json")
+        browse = QPushButton("Choose file")
+        browse.clicked.connect(lambda: self.pm_file.setText(
+            QFileDialog.getOpenFileName(self, "OAuth client file", "", "JSON (*.json)")[0]
+            or self.pm_file.text()))
+        row.addWidget(self.pm_file, 1)
+        row.addWidget(browse)
+        v.addLayout(row)
+        row2 = QHBoxLayout()
+        self.pm_connect = QPushButton("Connect Google account", objectName="Primary")
+        self.pm_connect.clicked.connect(self._pm_connect)
+        self.pm_disconnect = QPushButton("Disconnect")
+        self.pm_disconnect.clicked.connect(self._pm_disconnect)
+        row2.addWidget(self.pm_connect)
+        row2.addWidget(self.pm_disconnect)
+        row2.addStretch(1)
+        v.addLayout(row2)
+        self.pm_status = _hint("")
+        v.addWidget(self.pm_status)
+        v.addStretch(1)
+        self._pm_show_status()
+        return w
+
+    def _pm_show_status(self):
+        connected = postmaster.load_credentials() is not None
+        self.pm_status.setText("Connected. XML-ray fetches new statistics once a day." if connected
+                               else "Not connected.")
+        self.pm_disconnect.setEnabled(connected)
+
+    def _pm_connect(self):
+        try:
+            cid, secret = postmaster.read_client_file(self.pm_file.text().strip())
+        except postmaster.PostmasterError as exc:
+            QMessageBox.warning(self, "Gmail Postmaster", str(exc))
+            return
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        self.pm_connect.setEnabled(False)
+        self.pm_status.setText("Your browser opened. Sign in and allow read-only access, "
+                               "then come back here.")
+        opener = lambda url: QDesktopServices.openUrl(QUrl(url))  # noqa: E731
+        start(Task(postmaster.authorize, cid, secret, _MainThreadOpener(opener)),
+              lambda token, err: self._pm_done(cid, secret, token, err))
+
+    def _pm_done(self, cid, secret, token, err):
+        self.pm_connect.setEnabled(True)
+        if err:
+            self.pm_status.setText(f"Not connected: {err}")
+            return
+        try:
+            postmaster.save_credentials(cid, secret, token)
+        except Exception as exc:  # noqa: BLE001
+            self.pm_status.setText(f"Connected, but the sign-in couldn't be saved: {exc}")
+            return
+        self.s.setValue("postmaster/fetched", "")
+        self._pm_show_status()
+
+    def _pm_disconnect(self):
+        postmaster.forget_credentials()
+        self._pm_show_status()
+
     def _alerts(self) -> QWidget:
         w = QWidget(objectName="TabHost")
         v = QVBoxLayout(w)
@@ -502,6 +619,7 @@ class SettingsDialog(QDialog):
         s.setValue("updates/check_on_startup", self.updates.isChecked())
         s.setValue("lookup/blocklist", self.blocklists.isChecked())
         s.setValue("lookup/lookalike", self.lookalikes.isChecked())
+        s.setValue("lookup/certs", self.certs.isChecked())
         s.setValue("tray/enabled", self.tray.isChecked())
         if winstartup.supported():
             try:
@@ -554,6 +672,16 @@ class SettingsDialog(QDialog):
                          ("username", sc.username), ("from", sc.from_addr), ("to", sc.to),
                          ("day", self.sum_day.currentIndex()), ("hour", self.sum_hour.currentData())):
             s.setValue(f"summary/{key}", val)
+        if self.exp_on.isChecked() and not self.exp_path.text().strip():
+            QMessageBox.warning(self, "Choose a folder", "Choose a folder for exports, or turn "
+                                "automatic exports off.")
+            self.tabs.setCurrentIndex(self.TAB_EXPORTS)
+            return
+        for key, val in (("enabled", self.exp_on.isChecked()), ("path", self.exp_path.text().strip()),
+                         ("json", self.exp_json.isChecked()), ("csv", self.exp_csv.isChecked()),
+                         ("days", self.exp_freq.currentData())):
+            s.setValue(f"export/{key}", val)
+        s.setValue("postmaster/client_file", self.pm_file.text().strip())
         s.setValue("alerts/enabled", self.alerts_on.isChecked())
         s.setValue("alerts/notify", self.notify.isChecked())
         self.accept()
@@ -739,3 +867,18 @@ class AlertsDialog(QDialog):
     def _clear(self):
         self.storage.clear_alerts()
         self.list.clear()
+
+
+class _MainThreadOpener:
+    """Opening a browser must happen on the GUI thread; the sign-in runs in the background."""
+
+    def __init__(self, opener):
+        from PySide6.QtCore import QObject, Signal
+
+        class _Relay(QObject):
+            fire = Signal(str)
+        self._relay = _Relay()
+        self._relay.fire.connect(opener)
+
+    def __call__(self, url: str):
+        self._relay.fire.emit(url)
