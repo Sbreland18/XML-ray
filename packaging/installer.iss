@@ -36,6 +36,12 @@ WizardStyle=modern
 Compression=lzma2/max
 SolidCompression=yes
 CloseApplications=yes
+; The Release Manager passes /DSIGN=1 and /Sxmlraysign=... when code signing is turned on,
+; so the installer and the uninstaller are both signed.
+#ifdef SIGN
+SignTool=xmlraysign
+SignedUninstaller=yes
+#endif
 RestartApplications=no
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible

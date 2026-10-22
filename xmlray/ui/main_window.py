@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from PySide6.QtCore import QFileSystemWatcher, QSettings, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QFileSystemWatcher, QSettings, Qt, QThread, QTimer, QUrl
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QGuiApplication, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
@@ -16,19 +16,23 @@ from PySide6.QtWidgets import (
 )
 
 from .. import alerts as alerts_mod
-from .. import dnscheck, mailimport, rdap, updater
+from .. import blocklist, dnscheck, fixguide, logs, lookalike, mailimport, mailsend, rdap, roadmap, updater
 from ..__version__ import __version__
 from ..analyzer import SEVERITY_ORDER, Analysis, SourceSummary, analyze, daily_series
 from ..config import APP_NAME, GITHUB_URL, ORG_NAME, TAGLINE, asset
 from ..export import html_summary, print_html, senders_csv
+from ..analyzer import filter_reports
 from ..parser import LoadResult, dedupe, load_all, load_bytes
 from ..senders import reverse_lookup
 from ..storage import Storage
 from ..tlsrpt import FAILURE_TYPES, analyze_tls, dedupe_tls, label_for
 from . import style
 from .charts import TrendChart
+from .tasks import Task
 from .dialogs import (AlertsDialog, GlossaryDialog, RecordBuilderDialog, SettingsDialog,
-                      UpdateDialog, mailbox_config)
+                      UpdateDialog, mailbox_config, smtp_config)
+from .fixdialog import FixGuideDialog
+from .panels import ErrorDialog, LookalikePanel, ReportDialog, RoadmapPanel, WhatsNewDialog
 from .style import CATEGORY_COLORS, GRADE_COLORS, SEVERITY, T
 from .widgets import DropZone, FindingCard, GradePanel, NumericItem, StatCard
 
@@ -41,24 +45,6 @@ PERIODS = [("Latest 7 days", 7), ("Latest 30 days", 30), ("Latest 90 days", 90),
            ("Latest 12 months", 365), ("All time", 0)]
 RECORD_STATUS = {"ok": ("Good", "good"), "warn": ("Check", "medium"), "bad": ("Problem", "high"),
                  "missing": ("Missing", "high"), "info": ("Info", "low")}
-
-
-class Task(QThread):
-    """Run a function in the background. done(result, error_text)."""
-    done = Signal(object, str)
-    progress = Signal(int, int)
-
-    def __init__(self, fn, *args, with_progress: bool = False, **kwargs):
-        super().__init__()
-        self.fn, self.args, self.kwargs = fn, args, kwargs
-        if with_progress:
-            self.kwargs["progress"] = self.progress.emit
-
-    def run(self):
-        try:
-            self.done.emit(self.fn(*self.args, **self.kwargs), "")
-        except Exception as exc:  # noqa: BLE001
-            self.done.emit(None, str(exc) or exc.__class__.__name__)
 
 
 # ---------------------------------------------------------- background jobs
@@ -96,9 +82,26 @@ def _rdap_all(ips: list[str], storage: Storage, progress=None) -> dict[str, dict
     return out
 
 
-def _dns_all(jobs: list[tuple[str, str | None, set]]) -> dict:
+def _dns_all(jobs: list[tuple[str, str | None, set, bool]]) -> dict:
     resolver = dnscheck.DohResolver()
-    return {d: dnscheck.check_domain(d, resolver, p, sels) for d, p, sels in jobs}
+    return {d: dnscheck.check_domain(d, resolver, p, sels, parked=parked)
+            for d, p, sels, parked in jobs}
+
+
+def _scan_lookalikes(domains: list[str], progress=None) -> dict[str, list[dict]]:
+    out = {}
+    for i, d in enumerate(domains):
+        found = lookalike.scan(d, progress=(lambda a, b, i=i: progress(i * 1000 + a, len(domains) * 1000))
+                               if progress else None)
+        out[d] = [dict(domain=x.domain, has_mx=x.has_mx, has_web=x.has_web, created=x.created,
+                       registrar=x.registrar, abuse=x.abuse, risk=x.risk) for x in found]
+    return out
+
+
+def _as_lookalikes(rows: list[dict]) -> list:
+    return [lookalike.Lookalike(r["domain"], r.get("has_mx", False), r.get("has_web", False),
+                                r.get("created", ""), r.get("registrar", ""), r.get("abuse", ""))
+            for r in rows]
 
 
 def _download(info, progress=None, cancelled=None):
@@ -108,7 +111,8 @@ def _download(info, progress=None, cancelled=None):
 # ================================================================== window
 
 class MainWindow(QMainWindow):
-    SENDER_COLUMNS = ["Status", "Sender", "IP address", "Network owner", "Messages", "Passed",
+    SENDER_COLUMNS = ["Status", "Sender", "IP address", "Network owner", "Blocklists",
+                      "Messages", "Passed",
                       "SPF aligned", "DKIM aligned", "What happened", "Last seen",
                       "What this means"]
     REPORT_COLUMNS = ["Type", "Reported by", "Domain", "From", "To", "Messages", "Passed",
@@ -137,6 +141,11 @@ class MainWindow(QMainWindow):
         self._tray_hint_shown = False
         self._rdap_done: set[str] = set()
         self._mail_running = self._folder_running = False
+        self.bl_results: dict = self.storage.get_json("blocklist", max_age_days=0.5) or {}
+        self.lookalikes: dict[str, list[dict]] = {}
+        self._lookalike_running = self._summary_running = False
+        self._whats_new_checked = False
+        logs.on_crash(self._show_error)
 
         self.setWindowTitle(f"{APP_NAME}: {TAGLINE}")
         self.resize(1280, 840)
@@ -169,6 +178,9 @@ class MainWindow(QMainWindow):
         self.folder_timer.timeout.connect(self.scan_watched_folder)
         self.folder_debounce = QTimer(self, singleShot=True, interval=3000)
         self.folder_debounce.timeout.connect(self.scan_watched_folder)
+        self.summary_timer = QTimer(self, interval=15 * 60_000)
+        self.summary_timer.timeout.connect(self._maybe_send_summary)
+        self.summary_timer.start()
         self.watcher = QFileSystemWatcher(self)
         self.watcher.directoryChanged.connect(lambda _p: self.folder_debounce.start())
         try:
@@ -303,12 +315,22 @@ class MainWindow(QMainWindow):
         lay.addLayout(stats)
 
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_findings_tab(), "Action plan")
-        self.tabs.addTab(self._build_senders_tab(), "Senders")
-        self.tabs.addTab(self._build_trends_tab(), "Trends")
-        self.tabs.addTab(self._build_dns_tab(), "DNS check")
-        self.tabs.addTab(self._build_tls_tab(), "TLS")
-        self.tabs.addTab(self._build_reports_tab(), "Reports")
+        self.roadmap_panel = RoadmapPanel()
+        self.roadmap_panel.fix_requested.connect(self.show_fix)
+        self.lookalike_panel = LookalikePanel()
+        self.lookalike_panel.scan_requested.connect(lambda: self.scan_lookalikes(force=True))
+        self.lookalike_panel.mark.connect(self.mark_lookalike)
+        pages = [("plan", self._build_findings_tab(), "Action plan"),
+                 ("roadmap", self.roadmap_panel, "Road to protection"),
+                 ("senders", self._build_senders_tab(), "Senders"),
+                 ("trends", self._build_trends_tab(), "Trends"),
+                 ("dns", self._build_dns_tab(), "DNS check"),
+                 ("lookalikes", self.lookalike_panel, "Lookalikes"),
+                 ("tls", self._build_tls_tab(), "TLS"),
+                 ("reports", self._build_reports_tab(), "Reports")]
+        self.tab_index = {}
+        for key, widget, label in pages:
+            self.tab_index[key] = self.tabs.addTab(widget, label)
         lay.addWidget(self.tabs, 1)
         return page
 
@@ -459,8 +481,21 @@ class MainWindow(QMainWindow):
         return w
 
     def _build_reports_tab(self) -> QWidget:
+        w = QWidget(objectName="TabHost")
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(12, 10, 12, 0)
+        lay.addWidget(QLabel("Double-click a report to see every row in it and the original file.",
+                             objectName="Muted"))
         self.report_table = self._make_table(self.REPORT_COLUMNS)
-        return self.report_table
+        self.report_table.itemDoubleClicked.connect(self._open_report)
+        lay.addWidget(self.report_table, 1)
+        self._report_rows: list = []
+        return w
+
+    def _open_report(self, item) -> None:
+        idx = self.report_table.item(item.row(), 0).data(Qt.UserRole)
+        if idx is not None and 0 <= idx < len(self._report_rows):
+            ReportDialog(self._report_rows[idx], self).exec()
 
     def _make_table(self, columns: list[str]) -> QTableWidget:
         t = QTableWidget(0, len(columns))
@@ -494,14 +529,22 @@ class MainWindow(QMainWindow):
         t = mb.addMenu("&Tools")
         self._action(t, "DMARC record builder…", lambda: self.open_record_builder(""), "Ctrl+B")
         self._action(t, "Check DNS now", lambda: self.check_dns(force=True))
+        self._action(t, "Check blocklists now", lambda: self.check_blocklists(force=True))
+        self._action(t, "Check for lookalike domains now", lambda: self.scan_lookalikes(force=True))
+        self._action(t, "Send the weekly summary now", lambda: self.send_summary(manual=True))
         self._action(t, "Alerts…", self.show_alerts)
         t.addSeparator()
         self._action(t, "Settings…", self.show_settings, "Ctrl+,")
 
         h = mb.addMenu("&Help")
         self._action(h, "DMARC basics", self.show_glossary, QKeySequence.HelpContents)
+        self._action(h, "What's new", lambda: self.show_whats_new(manual=True))
         self._action(h, "Check for updates", lambda: self.check_updates(silent=False))
         self._action(h, "XML-ray on GitHub", lambda: QDesktopServices.openUrl(QUrl(GITHUB_URL)))
+        h.addSeparator()
+        self._action(h, "Save diagnostics for support…", self.save_diagnostics)
+        self._action(h, "Open the log folder", lambda: QDesktopServices.openUrl(
+            QUrl.fromLocalFile(str(logs.log_dir()))))
         h.addSeparator()
         self._action(h, f"About {APP_NAME}", self.show_about)
 
@@ -583,7 +626,13 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Couldn't open saved reports", err)
             result = LoadResult()
         self.reports, self.tls_reports = result.dmarc, result.tls
+        for d in sorted({r.policy.domain for r in self.reports}):
+            rows = self.storage.get_json(f"lookalikes:{d}")
+            if rows is not None:
+                self.lookalikes[d] = rows
         self._after_change(lookups=True)
+        QTimer.singleShot(1500, lambda: self.show_whats_new(manual=False))
+        QTimer.singleShot(20_000, self._maybe_send_summary)
 
     def _last_dir(self) -> str:
         return self.settings.value("paths/last_dir", str(Path.home()))
@@ -681,6 +730,9 @@ class MainWindow(QMainWindow):
         if lookups and not self.sample_mode:
             self._lookup_hostnames()
             self.check_dns(force=False)
+            QTimer.singleShot(6000, lambda: self.check_blocklists(force=False))
+            if self._setting("lookup/lookalike", True, bool):
+                QTimer.singleShot(8000, lambda: self.scan_lookalikes(force=False))
 
     def _rebuild_domains(self) -> None:
         current = self.domain_combo.currentData()
@@ -750,6 +802,7 @@ class MainWindow(QMainWindow):
             self.owners.update(results)
             self.statusBar().showMessage("Network owners updated.", 4000)
             self.fill_senders()
+        self.check_blocklists(force=False)
 
     def check_dns(self, force: bool) -> None:
         if self.sample_mode:
@@ -758,15 +811,21 @@ class MainWindow(QMainWindow):
             self.dns_label.setText("Automatic DNS checks are off (Tools > Settings). Click "
                                    "Check DNS now to run one.")
             return
-        domains = sorted({r.policy.domain for r in self.reports})
+        report_domains = {r.policy.domain for r in self.reports}
+        self.storage.add_domains(report_domains)
+        mine = self.storage.my_domains()
         now = datetime.now(timezone.utc)
         jobs = []
-        for d in domains:
+        for d in sorted(set(mine) | report_domains):
             prev = self.dns_results.get(d)
             if not force and prev and now - prev.checked_at < timedelta(hours=6):
                 continue
-            latest = max((r for r in self.reports if r.policy.domain == d), key=lambda r: r.end)
-            jobs.append((d, latest.policy.p, dnscheck.selectors_from_reports(self.reports, d)))
+            reps = [r for r in self.reports if r.policy.domain == d]
+            latest_p = max(reps, key=lambda r: r.end).policy.p if reps else None
+            jobs.append((d, latest_p, dnscheck.selectors_from_reports(self.reports, d),
+                         mine.get(d, False)))
+        for gone in set(self.dns_results) - set(mine) - report_domains:
+            self.dns_results.pop(gone, None)
         if not jobs:
             return
         self.dns_btn.setEnabled(False)
@@ -805,6 +864,12 @@ class MainWindow(QMainWindow):
             if domain is None or d == domain:
                 dns_findings += res.findings
         found = self.analysis.findings + dns_findings + self.tls_analysis.findings
+        found += blocklist.findings(self.bl_results, self.analysis.sources)
+        owned = {k.split(":", 1)[1] for k, (_l, st) in self.labels.items()
+                 if k.startswith("domain:") and st in ("mine", "ignore")}
+        for d, rows in self.lookalikes.items():
+            if domain is None or d == domain:
+                found += lookalike.findings(_as_lookalikes(rows), owned, d)
         if not self.reports:
             found = [f for f in found if f.key != "healthy"]
         found.sort(key=lambda f: (SEVERITY_ORDER[f.severity], -f.affected))
@@ -814,6 +879,8 @@ class MainWindow(QMainWindow):
         self.fill_senders()
         self.fill_trend_choices()
         self.fill_dns()
+        self.fill_roadmap()
+        self.fill_lookalikes()
         self.fill_tls()
         self.fill_reports()
 
@@ -848,14 +915,18 @@ class MainWindow(QMainWindow):
             self.card_period.set("–", "")
         active = sum(1 for f, state in self._finding_states() if state != "done"
                      and f.severity != "good")
-        self.tabs.setTabText(0, f"Action plan ({active})" if active else "Action plan")
-        self.tabs.setTabText(1, f"Senders ({len(a.sources)})")
+        ti = self.tab_index
+        self.tabs.setTabText(ti["plan"], f"Action plan ({active})" if active else "Action plan")
+        self.tabs.setTabText(ti["senders"], f"Senders ({len(a.sources)})")
         dns_problems = sum(1 for d in self.dns_results.values() for f in d.findings
                            if f.severity in ("critical", "high", "medium"))
-        self.tabs.setTabText(3, f"DNS check ({dns_problems})" if dns_problems else "DNS check")
+        self.tabs.setTabText(ti["dns"], f"DNS check ({dns_problems})" if dns_problems else "DNS check")
+        risky = sum(1 for rows in self.lookalikes.values() for r in rows
+                    if r["risk"] in ("high", "medium"))
+        self.tabs.setTabText(ti["lookalikes"], f"Lookalikes ({risky})" if risky else "Lookalikes")
         tls_n = len(self.tls_analysis.reports) if self.tls_analysis else 0
-        self.tabs.setTabText(4, f"TLS ({tls_n})" if tls_n else "TLS")
-        self.tabs.setTabText(5, f"Reports ({n_rep + tls_n})")
+        self.tabs.setTabText(ti["tls"], f"TLS ({tls_n})" if tls_n else "TLS")
+        self.tabs.setTabText(ti["reports"], f"Reports ({n_rep + tls_n})")
 
     # ----------------------------------------------------- findings / done
 
@@ -921,6 +992,7 @@ class MainWindow(QMainWindow):
         card.show_senders.connect(self.filter_to_ips)
         card.toggle_done.connect(self.toggle_done)
         card.open_builder.connect(self.open_record_builder)
+        card.fix_requested.connect(self.show_fix)
         return card
 
     def toggle_done(self, key: str, done: bool) -> None:
@@ -937,7 +1009,7 @@ class MainWindow(QMainWindow):
         self.banner.setVisible(True)
         self.sender_filter.setCurrentIndex(0)
         self.fill_senders()
-        self.tabs.setCurrentIndex(1)
+        self.tabs.setCurrentIndex(self.tab_index["senders"])
 
     def clear_ip_filter(self) -> None:
         self.ip_filter = None
@@ -984,8 +1056,12 @@ class MainWindow(QMainWindow):
                 name.setToolTip(s.hostname)
             owner = rdap.describe(self.owners.get(s.ip, {}))
             last = s.last_seen.timestamp() if s.last_seen else 0
+            bl_text = blocklist.summary(self.bl_results.get(s.ip, {}))
+            bl_item = QTableWidgetItem(bl_text)
+            if bl_text.startswith("Listed"):
+                bl_item.setForeground(QColor(SEVERITY["critical"][1]))
             cells = [
-                status, name, QTableWidgetItem(s.ip), QTableWidgetItem(owner),
+                status, name, QTableWidgetItem(s.ip), QTableWidgetItem(owner), bl_item,
                 NumericItem(s.messages),
                 NumericItem(s.pass_rate, f"{s.pass_rate*100:.0f}%"),
                 NumericItem(s.spf_aligned / s.messages if s.messages else 0, f"{s.spf_aligned:,}"),
@@ -996,6 +1072,9 @@ class MainWindow(QMainWindow):
             ]
             cells[3].setToolTip(owner)
             cells[-1].setToolTip(s.meaning)
+            if bl_text == "Couldn't check":
+                bl_item.setToolTip("These blocklists didn't answer your network's DNS server. "
+                                   "Many refuse queries from large public DNS services.")
             for c, item in enumerate(cells):
                 t.setItem(r, c, item)
         t.setSortingEnabled(True)
@@ -1120,7 +1199,7 @@ class MainWindow(QMainWindow):
             self.trend_combo.addItem(f"{s.label} ({s.ip})", s.ip)
             idx = self.trend_combo.count() - 1
         self.trend_combo.setCurrentIndex(idx)
-        self.tabs.setCurrentIndex(2)
+        self.tabs.setCurrentIndex(self.tab_index["trends"])
 
     # --------------------------------------------------------------- trends
 
@@ -1237,6 +1316,7 @@ class MainWindow(QMainWindow):
         reps = self.analysis.reports
         tls = self.tls_analysis.reports if self.tls_analysis else []
         t.setRowCount(len(reps) + len(tls))
+        self._report_rows = list(reps) + list(tls)
         row = 0
         for rep in reps:
             total = rep.total_messages
@@ -1248,6 +1328,7 @@ class MainWindow(QMainWindow):
                      QTableWidgetItem(f"{rep.end:%Y-%m-%d %H:%M}"),
                      NumericItem(total), NumericItem(pct, f"{pct*100:.0f}%"),
                      QTableWidgetItem(pol), QTableWidgetItem(rep.source_file)]
+            cells[0].setData(Qt.UserRole, row)
             for c, item in enumerate(cells):
                 t.setItem(row, c, item)
             row += 1
@@ -1262,6 +1343,7 @@ class MainWindow(QMainWindow):
                      NumericItem(total), NumericItem(pct, f"{pct*100:.0f}%"),
                      QTableWidgetItem(", ".join(sorted({p.policy_type for p in rep.policies}))),
                      QTableWidgetItem(rep.source_file)]
+            cells[0].setData(Qt.UserRole, row)
             for c, item in enumerate(cells):
                 t.setItem(row, c, item)
             row += 1
@@ -1373,12 +1455,250 @@ class MainWindow(QMainWindow):
                 self._ingest(result, "", "folder")
         self._run(Task(mailimport.scan_folder, path, self.storage), done)
 
+    # ----------------------------------------------------------- fix guides
+
+    def show_fix(self, finding) -> None:
+        domains = sorted(self.analysis.policies) if self.analysis else []
+        ctx = fixguide.FixContext(dns=self.dns_results, analysis=self.analysis,
+                                  domains=domains or sorted(self.dns_results))
+        plan = fixguide.build_plan(finding, ctx)
+        res = self.dns_results.get(plan.domain)
+        if plan.changes and res is None and not self.sample_mode:
+            self.statusBar().showMessage("Tip: run the DNS check so the guide can compare "
+                                         "against your current records.", 8000)
+        host = fixguide.detect_host(res.ns if res else [])
+        dlg = FixGuideDialog(plan, host, self)
+        dlg.fixed.connect(lambda _d: self.check_dns(force=True))
+        dlg.exec()
+
+    def fill_roadmap(self) -> None:
+        domain = self.domain_combo.currentData()
+        parked = {d for d, p in self.storage.my_domains().items() if p}
+        maps = {}
+        for d in sorted(self.analysis.policies) if self.analysis else []:
+            if (domain is None or d == domain) and d not in parked:
+                maps[d] = roadmap.build_roadmap(d, self.analysis, self.dns_results.get(d),
+                                                self.reports, self.findings)
+        self.roadmap_panel.show_roadmaps(maps)
+
+    # ---------------------------------------------------------- blocklists
+
+    def check_blocklists(self, force: bool) -> None:
+        if self.sample_mode or not self.analysis or getattr(self, "_bl_running", False):
+            return
+        if not force and not self._setting("lookup/blocklist", True, bool):
+            return
+        ips = [s.ip for s in self.analysis.sources
+               if (s.category in ("authorized", "partial", "service_failing") or s.status == "mine")
+               and (force or s.ip not in self.bl_results)][:100]
+        if not ips:
+            return
+        self._bl_running = True
+        task = Task(blocklist.check_ips, ips, with_progress=True)
+        task.progress.connect(lambda i, n: self.statusBar().showMessage(
+            f"Checking spam blocklists… {i} of {n}"))
+        self._run(task, self._blocklists_ready)
+
+    def _blocklists_ready(self, results, err) -> None:
+        self._bl_running = False
+        if err or not results:
+            return
+        self.bl_results.update(results)
+        self.storage.set_json("blocklist", self.bl_results)
+        listed = sum(1 for r in results.values() if "listed" in r.values())
+        self.statusBar().showMessage(
+            f"Blocklists checked: {listed} of your servers listed." if listed
+            else "Blocklists checked: none of your servers are listed.", 8000)
+        self.refresh()
+
+    # ----------------------------------------------------------- lookalikes
+
+    def scan_lookalikes(self, force: bool) -> None:
+        if self.sample_mode or self._lookalike_running:
+            return
+        parked = {d for d, p in self.storage.my_domains().items() if p}
+        domains = [d for d in sorted({r.policy.domain for r in self.reports}) if d not in parked]
+        if not force:
+            domains = [d for d in domains
+                       if self.storage.get_json(f"lookalikes:{d}", max_age_days=7) is None]
+        if not domains:
+            if force:
+                self.statusBar().showMessage("Add reports for a domain first.", 6000)
+            return
+        self._lookalike_running = True
+        self.lookalike_panel.scan_btn.setEnabled(False)
+        self.lookalike_panel.status.setText(f"Checking lookalikes of {', '.join(domains)}… "
+                                            "this takes a minute or two.")
+        task = Task(_scan_lookalikes, domains, with_progress=True)
+        task.progress.connect(lambda i, n: self.statusBar().showMessage(
+            f"Looking for lookalike domains… {i * 100 // max(n, 1)}%"))
+        self._run(task, self._lookalikes_ready)
+
+    def _lookalikes_ready(self, results, err) -> None:
+        self._lookalike_running = False
+        self.lookalike_panel.scan_btn.setEnabled(True)
+        if err:
+            self.lookalike_panel.status.setText(f"The lookalike check couldn't finish: {err}")
+            return
+        new_alerts = []
+        for d, rows in (results or {}).items():
+            before = self.storage.get_json(f"lookalikes:{d}")
+            if before is not None:
+                known = {r["domain"] for r in before}
+                fresh = [r for r in rows if r["domain"] not in known and r["risk"] in ("high", "medium")]
+                if fresh:
+                    names = ", ".join(r["domain"] for r in fresh[:3])
+                    new_alerts.append(alerts_mod.Alert(
+                        "lookalike", f"New lookalike of {d} can send email",
+                        f"Newly found: {names}. Check the Lookalikes tab."))
+            self.storage.set_json(f"lookalikes:{d}", rows)
+            self.lookalikes[d] = rows
+        if new_alerts and self._setting("alerts/enabled", True, bool):
+            self.storage.add_alerts(new_alerts)
+            if self.tray and self.tray.isVisible() and self._setting("alerts/notify", True, bool):
+                self.tray.showMessage(f"XML-ray: {new_alerts[0].title}", new_alerts[0].body,
+                                      QSystemTrayIcon.Warning, 15000)
+            self._update_header()
+        self.statusBar().showMessage("Lookalike check finished.", 6000)
+        self.refresh()
+
+    def fill_lookalikes(self) -> None:
+        domain = self.domain_combo.currentData()
+        rows = [r for d, rs in sorted(self.lookalikes.items()) if domain is None or d == domain
+                for r in rs]
+        marks = {k.split(":", 1)[1]: st for k, (_l, st) in self.labels.items()
+                 if k.startswith("domain:")}
+        checked = [self.storage.get_json(f"lookalikes:{d}") is not None
+                   for d in self.lookalikes if domain is None or d == domain]
+        if self.sample_mode:
+            status = "The lookalike check is off while sample reports are shown."
+        elif not checked:
+            status = "XML-ray hasn't looked for lookalike domains yet."
+        else:
+            risky = sum(1 for r in rows if r["risk"] in ("high", "medium"))
+            status = (f"Found {len(rows)} registered lookalike{'s' if len(rows) != 1 else ''}"
+                      f", {risky} with email servers. XML-ray re-checks weekly.")
+        self.lookalike_panel.show_results(rows, marks, status)
+
+    def mark_lookalike(self, name: str, status: str) -> None:
+        self.storage.set_label(f"domain:{name}", label="", status=status)
+        self.labels = self.storage.labels()
+        self.refresh()
+
+    # ------------------------------------------------------- weekly summary
+
+    def _maybe_send_summary(self) -> None:
+        if not self._setting("summary/enabled", False, bool) or self.sample_mode or not self.reports:
+            return
+        now = datetime.now()
+        day, hour = self._setting("summary/day", 0, int), self._setting("summary/hour", 8, int)
+        due = (now - timedelta(days=(now.weekday() - day) % 7)).replace(
+            hour=hour, minute=0, second=0, microsecond=0)
+        if due > now:
+            due -= timedelta(days=7)
+        last = self.storage.get_json("summary:last_sent")
+        if last and datetime.fromisoformat(last) >= due:
+            return
+        self.send_summary(manual=False)
+
+    def _summary_parts(self):
+        if not self.reports:
+            raise mailsend.SendError("Add some reports first.")
+        latest = max(r.end for r in self.reports)
+        week = analyze(self.reports, None, self.hostnames, self.labels, latest - timedelta(days=7))
+        prev_reps = [r for r in filter_reports(self.reports, None, latest - timedelta(days=14))
+                     if r.end < latest - timedelta(days=7)]
+        prev = analyze(prev_reps, None, self.hostnames, self.labels).pass_pct if prev_reps else None
+        cutoff = datetime.now().timestamp() - 7 * 86400
+        recent = [a for a in self.storage.recent_alerts(50) if a["ts"] >= cutoff]
+        active = [f for f, state in self._finding_states() if state != "done"]
+        return mailsend.weekly_message(week, active, prev, recent, print_html)
+
+    def _send_summary_now(self, cfg, password, test: bool = False) -> None:
+        subject, html_body, text = self._summary_parts()
+        if test:
+            subject = "[Test] " + subject
+        mailsend.send(cfg, password, subject, html_body, text)
+
+    def send_summary(self, manual: bool) -> None:
+        cfg = smtp_config(self.settings)
+        if not cfg.host or not cfg.recipients:
+            if manual:
+                QMessageBox.information(self, "Set up the summary email",
+                                        "Set up the weekly summary in Tools > Settings > Summary email.")
+                self.show_settings(tab=SettingsDialog.TAB_SUMMARY)
+            return
+        if self._summary_running:
+            return
+        self._summary_running = True
+        password = mailsend.get_password(cfg)
+
+        def done(_r, err):
+            self._summary_running = False
+            if err:
+                logs.log.warning("Weekly summary failed: %s", err)
+                self.statusBar().showMessage(f"The weekly summary couldn't be sent: {err}", 15000)
+                if manual:
+                    QMessageBox.warning(self, "Summary not sent", err)
+                return
+            self.storage.set_json("summary:last_sent", datetime.now().isoformat())
+            self.statusBar().showMessage(f"Weekly summary sent to {cfg.to}.", 8000)
+        self._run(Task(self._send_summary_now, cfg, password), done,
+                  "Sending the weekly summary…" if manual else "")
+
+    # ------------------------------------------------- what's new / support
+
+    def show_whats_new(self, manual: bool) -> None:
+        if not manual:
+            if self._whats_new_checked:
+                return
+            self._whats_new_checked = True
+            last = self.storage.get_json("app:last_version")
+            self.storage.set_json("app:last_version", __version__)
+            if not last or not updater.is_newer(__version__, last):
+                return
+
+        def done(info, err):
+            if info is None and not manual:
+                return
+            WhatsNewDialog(__version__, info.notes if info else "", self).exec()
+        self._run(Task(updater.fetch_release, f"v{__version__}"), done)
+
+    def save_diagnostics(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save diagnostics", str(Path.home() / f"XML-ray diagnostics {__version__}.zip"),
+            "Zip file (*.zip)")
+        if not path:
+            return
+        settings = {k: self.settings.value(k) for k in self.settings.allKeys()}
+        logs.diagnostics_zip(path, {"Saved reports": self.storage.report_count(),
+                                    "Domains": ", ".join(self.storage.my_domains())}, settings)
+        box = QMessageBox(self)
+        box.setWindowTitle("Diagnostics saved")
+        box.setText(f"Saved to {path}. It contains XML-ray's log and settings, but no "
+                    "reports, passwords or tokens.")
+        report = box.addButton("Report a problem on GitHub", QMessageBox.AcceptRole)
+        box.addButton(QMessageBox.Close)
+        box.exec()
+        if box.clickedButton() is report:
+            QDesktopServices.openUrl(QUrl(f"{GITHUB_URL}/issues/new"))
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path).parent)))
+
+    def _show_error(self, details: str) -> None:
+        dlg = ErrorDialog(details, self)
+        dlg.save_diagnostics.connect(self.save_diagnostics)
+        dlg.exec()
+
     # ---------------------------------------------------------------- dialogs
 
     def show_settings(self, tab: int = 0) -> None:
         old_theme = self._setting("appearance/theme", "system")
-        dlg = SettingsDialog(self.settings, self, start_tab=tab)
+        old_domains = self.storage.my_domains()
+        dlg = SettingsDialog(self.settings, self, start_tab=tab, storage=self.storage,
+                             send_test=lambda cfg, pw: self._send_summary_now(cfg, pw, test=True))
         if dlg.exec():
+            if self.storage.my_domains() != old_domains:
+                self.check_dns(force=True)
             if self._setting("appearance/theme", "system") != old_theme:
                 self.apply_theme()
             self._apply_automation()

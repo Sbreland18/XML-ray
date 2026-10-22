@@ -37,6 +37,7 @@ from xmlray.ui.style import STYLESHEET, light_palette  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import github_sync  # noqa: E402  (builder/github_sync.py)
+import signing  # noqa: E402  (builder/signing.py)
 
 try:
     import keyring
@@ -238,8 +239,8 @@ class Pipeline(QThread):
         return github_sync.push(str(ROOT), api, branch, f"Release v{self.cfg['version']}",
                                 log=self.log.emit)
 
-    def _sh(self, cmd: list[str]) -> None:
-        self.log.emit("> " + " ".join(f'"{x}"' if " " in x else x for x in cmd))
+    def _sh(self, cmd: list[str], show: list[str] | None = None) -> None:
+        self.log.emit("> " + " ".join(f'"{x}"' if " " in x else x for x in (show or cmd)))
         flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0  # type: ignore[attr-defined]
         proc = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, encoding="utf-8", errors="replace", creationflags=flags)
@@ -273,8 +274,31 @@ class Pipeline(QThread):
             raise RuntimeError(f"A release tagged {tag} already exists. Choose a new version.")
         self.log.emit(f"GitHub access OK. {tag} is available.")
 
+    def _signing(self) -> bool:
+        return self.cfg.get("sign", {}).get("mode", "off") != "off"
+
+    def _signtool(self) -> str:
+        tool = self.cfg["sign"].get("signtool") or signing.find_signtool()
+        if not tool or not Path(tool).is_file():
+            raise RuntimeError("signtool.exe wasn't found. Install the Windows SDK (only the "
+                               "“Signing Tools for Desktop Apps” part is needed) or set its path.")
+        return tool
+
+    def _sign(self, path: Path) -> None:
+        args = [self._signtool(), *signing.sign_args(self.cfg["sign"]), str(path)]
+        self._sh(args, show=signing.masked(args))
+        self._sh([self._signtool(), "verify", "/pa", str(path)])
+        self.log.emit(f"Signed {path.name}")
+
     def _build(self) -> None:
         c = self.cfg
+        if c.get("run_tests"):
+            self.stage.emit("Running the tests")
+            try:
+                self._sh([sys.executable, "-m", "pytest", "-q", "tests"])
+            except RuntimeError:
+                raise RuntimeError("Some tests failed, so nothing was built or published. "
+                                   "See the log for which ones.") from None
         self.stage.emit("Writing version number")
         write_version(c["version"])
         self.log.emit(f"Set xmlray/__version__.py to {c['version']}")
@@ -285,12 +309,26 @@ class Pipeline(QThread):
         if c["clean"]:
             cmd.append("--clean")
         self._sh(cmd)
+        if self._signing():
+            self.stage.emit("Signing XML-ray.exe")
+            self._sign(DIST / "XML-ray" / "XML-ray.exe")
 
         self.stage.emit("Creating the installer with Inno Setup")
         if not c["iscc"] or not Path(c["iscc"]).is_file():
             raise RuntimeError("Inno Setup's ISCC.exe wasn't found. Install Inno Setup 6.3+ "
                                "or browse to ISCC.exe.")
-        self._sh([c["iscc"], f"/DMyAppVersion={c['version']}", str(ISS_FILE)])
+        cmd = [c["iscc"], f"/DMyAppVersion={c['version']}"]
+        show = list(cmd)
+        if self._signing():
+            tool = self._signtool()
+            cmd += ["/DSIGN=1", signing.inno_sign_switch(tool, c["sign"])]
+            show += ["/DSIGN=1", signing.inno_sign_switch(
+                tool, {**c["sign"], "password": "********"} if c["sign"].get("password")
+                else c["sign"])]
+        self._sh(cmd + [str(ISS_FILE)], show=show + [str(ISS_FILE)])
+        if self._signing():
+            self.stage.emit("Checking the installer's signature")
+            self._sh([self._signtool(), "verify", "/pa", str(installer_path(c["version"]))])
 
     def _checksum(self, path: Path) -> str:
         self.stage.emit("Calculating checksum")
@@ -397,6 +435,7 @@ class ReleaseManager(QMainWindow):
         form_scroll = QScrollArea()
         form_scroll.setWidgetResizable(True)
         form_scroll.setFrameShape(QFrame.NoFrame)
+        form_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         form_scroll.setWidget(self._build_form())
         split.addWidget(form_scroll)
         split.addWidget(self._build_log())
@@ -517,7 +556,60 @@ class ReleaseManager(QMainWindow):
         self.clean = QCheckBox("Clean build (slower, avoids stale files)")
         self.clean.setChecked(True)
         t.addRow("", self.clean)
+        self.run_tests = QCheckBox("Run the tests first, and stop if any fail")
+        self.run_tests.setChecked(True)
+        t.addRow("", self.run_tests)
         lay.addWidget(tools)
+
+        sign = QGroupBox("Code signing (removes the Windows “unknown publisher” warning)")
+        sf = QFormLayout(sign)
+        self.sign_mode = QComboBox()
+        for label, val in (("Don't sign", "off"), ("Certificate file (.pfx)", "pfx"),
+                           ("Certificate in Windows store (USB token, EV)", "store"),
+                           ("Azure Trusted Signing", "azure")):
+            self.sign_mode.addItem(label, val)
+        sf.addRow("Method", self.sign_mode)
+        self.signtool = QLineEdit(signing.find_signtool())
+        self.signtool.setPlaceholderText("signtool.exe (from the Windows SDK)")
+        self.pfx = QLineEdit()
+        self.pfx_pass = QLineEdit()
+        self.pfx_pass.setEchoMode(QLineEdit.Password)
+        self.pfx_pass.setPlaceholderText("Saved in Windows Credential Manager")
+        self.thumb = QLineEdit()
+        self.thumb.setPlaceholderText("40-character SHA-1 thumbprint")
+        self.dlib = QLineEdit()
+        self.dlib.setPlaceholderText("Azure.CodeSigning.Dlib.dll")
+        self.metadata = QLineEdit()
+        self.metadata.setPlaceholderText("metadata.json")
+        self.ts_url = QLineEdit()
+        self.ts_url.setPlaceholderText("Timestamp server (leave blank for the default)")
+        self._sign_rows = {}
+        for key, label, field, browse in (
+                ("signtool", "signtool.exe", self.signtool, "signtool.exe (signtool.exe)"),
+                ("pfx", "Certificate file", self.pfx, "Certificates (*.pfx *.p12)"),
+                ("password", "Certificate password", self.pfx_pass, None),
+                ("thumbprint", "Thumbprint", self.thumb, None),
+                ("dlib", "Dlib file", self.dlib, "Azure.CodeSigning.Dlib.dll (*.dll)"),
+                ("metadata", "Metadata file", self.metadata, "metadata.json (*.json)"),
+                ("timestamp", "Timestamp server", self.ts_url, None)):
+            row = QWidget()
+            h = QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.addWidget(field, 1)
+            if browse:
+                b = QPushButton("Browse")
+                b.clicked.connect(lambda _=False, f=field, flt=browse: self._browse_into(f, flt))
+                h.addWidget(b)
+            sf.addRow(label, row)
+            self._sign_rows[key] = (sf.labelForField(row), row)
+        hint = QLabel("A code-signing certificate is bought from a certificate authority "
+                      "(for example DigiCert, Sectigo or SSL.com) or from Microsoft's "
+                      "Azure Trusted Signing service.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#5B7083;")
+        sf.addRow("", hint)
+        self.sign_mode.currentIndexChanged.connect(self._sign_mode_changed)
+        lay.addWidget(sign)
 
         buttons = QHBoxLayout()
         self.btn_build = QPushButton("Build installer")
@@ -569,6 +661,18 @@ class ReleaseManager(QMainWindow):
             idx = 0
         self.source.setCurrentIndex(max(idx, 0))
         self.pull_first.setChecked(s.value("pull_first", False, type=bool))
+        self.run_tests.setChecked(s.value("run_tests", True, type=bool))
+        self.sign_mode.setCurrentIndex(max(self.sign_mode.findData(s.value("sign/mode", "off")), 0))
+        for key, field in (("signtool", self.signtool), ("pfx", self.pfx), ("thumbprint", self.thumb),
+                           ("dlib", self.dlib), ("metadata", self.metadata), ("timestamp", self.ts_url)):
+            if s.value(f"sign/{key}"):
+                field.setText(s.value(f"sign/{key}"))
+        if keyring is not None:
+            try:
+                self.pfx_pass.setText(keyring.get_password(KEYRING_SERVICE, "pfx-password") or "")
+            except Exception:  # noqa: BLE001
+                pass
+        self._sign_mode_changed()
         self._show_sync_state()
         token = os.environ.get("GITHUB_TOKEN", "")
         if keyring is not None:
@@ -586,6 +690,15 @@ class ReleaseManager(QMainWindow):
         s.setValue("iscc", self.iscc.text().strip())
         s.setValue("source", self.source.currentData())
         s.setValue("pull_first", self.pull_first.isChecked())
+        s.setValue("run_tests", self.run_tests.isChecked())
+        for k, v in self.sign_opts().items():
+            if k != "password":
+                s.setValue(f"sign/{k}", v)
+        if keyring is not None and self.pfx_pass.text():
+            try:
+                keyring.set_password(KEYRING_SERVICE, "pfx-password", self.pfx_pass.text())
+            except Exception:  # noqa: BLE001
+                pass
         if keyring is not None:
             try:
                 if self.remember.isChecked() and self.token.text().strip():
@@ -596,6 +709,27 @@ class ReleaseManager(QMainWindow):
                 pass
 
     # actions ------------------------------------------------------------
+
+    def _browse_into(self, field, flt):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose a file", field.text(), flt)
+        if path:
+            field.setText(path)
+
+    def _sign_mode_changed(self):
+        mode = self.sign_mode.currentData()
+        visible = {"off": set(), "pfx": {"signtool", "pfx", "password", "timestamp"},
+                   "store": {"signtool", "thumbprint", "timestamp"},
+                   "azure": {"signtool", "dlib", "metadata", "timestamp"}}[mode]
+        for key, (label, row) in self._sign_rows.items():
+            label.setVisible(key in visible)
+            row.setVisible(key in visible)
+
+    def sign_opts(self) -> dict:
+        return dict(mode=self.sign_mode.currentData(), signtool=self.signtool.text().strip(),
+                    pfx=self.pfx.text().strip(), password=self.pfx_pass.text(),
+                    thumbprint=self.thumb.text().strip(), dlib=self.dlib.text().strip(),
+                    metadata=self.metadata.text().strip(), timestamp=self.ts_url.text().strip(),
+                    description="XML-ray")
 
     def browse_iscc(self):
         path, _ = QFileDialog.getOpenFileName(self, "Find ISCC.exe", self.iscc.text(),
@@ -683,6 +817,16 @@ class ReleaseManager(QMainWindow):
                     "Everyone running XML-ray will be offered this update.") != QMessageBox.Yes:
                 return
 
+        if build and self.sign_mode.currentData() != "off":
+            try:
+                signing.sign_args(self.sign_opts())
+            except RuntimeError as exc:
+                QMessageBox.warning(self, "Code signing", str(exc))
+                return
+        if build and self.run_tests.isChecked() and not importlib.util.find_spec("pytest"):
+            QMessageBox.warning(self, "pytest missing", "Run: pip install -r requirements-dev.txt "
+                                "(Release Manager.bat does this for you).")
+            return
         self._save_settings()
         cfg = dict(
             version=version, build=build, publish=publish,
@@ -693,6 +837,7 @@ class ReleaseManager(QMainWindow):
             pull_first=self.pull_first.isChecked() and not only_pull,
             only_pull=only_pull, conflicts=conflicts,
             iscc=self.iscc.text().strip(), clean=self.clean.isChecked(),
+            run_tests=self.run_tests.isChecked(), sign=self.sign_opts(),
         )
         self.log.clear()
         self._set_running(True)

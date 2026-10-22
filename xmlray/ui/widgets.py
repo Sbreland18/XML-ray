@@ -89,6 +89,7 @@ class FindingCard(QFrame):
     show_senders = Signal(list, str)
     toggle_done = Signal(str, bool)
     open_builder = Signal(str)
+    fix_requested = Signal(object)
 
     def __init__(self, finding: Finding, done_at: float | None = None,
                  reopened: bool = False, parent=None):
@@ -153,7 +154,7 @@ class FindingCard(QFrame):
                        "dns:dmarc-missing:", "dns:dmarc-invalid:", "dns:dmarc-no-rua:"):
             if finding.key.startswith(prefix):
                 policy_domain = finding.key.split(":")[-1]
-        if finding.ips or policy_domain:
+        if finding.severity != "good" or finding.ips or policy_domain:
             foot = QHBoxLayout()
             if finding.ips:
                 n = len(finding.ips)
@@ -170,6 +171,11 @@ class FindingCard(QFrame):
                 btn.setCursor(Qt.PointingHandCursor)
                 btn.clicked.connect(lambda: self.show_senders.emit(finding.ips, finding.title))
                 foot.addWidget(btn)
+            if finding.severity != "good":
+                fix = QPushButton("Show me how to fix this", objectName="Primary")
+                fix.setCursor(Qt.PointingHandCursor)
+                fix.clicked.connect(lambda: self.fix_requested.emit(finding))
+                foot.addWidget(fix)
             lay.addLayout(foot)
 
 

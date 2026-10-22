@@ -99,6 +99,33 @@ def fetch_latest() -> ReleaseInfo | None:
     return info
 
 
+def fetch_release_notes(version: str) -> str | None:
+    """Release notes for one version (used by the “What's new” screen)."""
+    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/tags/v{version}"
+    try:
+        with _request(url) as resp:
+            return json.load(resp).get("body") or ""
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return None
+
+
+def fetch_release(tag: str) -> ReleaseInfo | None:
+    """Release notes for one version (used by the "What's new" screen)."""
+    url = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/tags/{tag}"
+    try:
+        with _request(url) as resp:
+            data = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise UpdateError(f"GitHub answered with error {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise UpdateError("Couldn't reach GitHub.") from exc
+    t = data.get("tag_name", tag)
+    return ReleaseInfo(version=t.lstrip("vV"), tag=t, name=data.get("name") or t,
+                       notes=data.get("body") or "", html_url=data.get("html_url", ""))
+
+
 def check_for_update(current_version: str) -> ReleaseInfo | None:
     """Return release info when a newer version exists, otherwise None."""
     latest = fetch_latest()

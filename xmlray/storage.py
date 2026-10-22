@@ -32,6 +32,8 @@ CREATE TABLE IF NOT EXISTS labels (ip TEXT PRIMARY KEY, label TEXT, status TEXT)
 CREATE TABLE IF NOT EXISTS acks (fkey TEXT PRIMARY KEY, ts REAL);
 CREATE TABLE IF NOT EXISTS rdap (ip TEXT PRIMARY KEY, ts REAL, data TEXT);
 CREATE TABLE IF NOT EXISTS seen (skey TEXT PRIMARY KEY, ts REAL);
+CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, ts REAL, data TEXT);
+CREATE TABLE IF NOT EXISTS domains (name TEXT PRIMARY KEY, parked INTEGER DEFAULT 0, added REAL);
 CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, kind TEXT, title TEXT, body TEXT,
     read INTEGER DEFAULT 0
@@ -198,3 +200,38 @@ class Storage:
     def clear_alerts(self) -> None:
         with self._db() as c:
             c.execute("DELETE FROM alerts")
+
+    # ------------------------------------------------------------ key/value
+
+    def get_json(self, key: str, max_age_days: float | None = None):
+        with self._db() as c:
+            row = c.execute("SELECT ts, data FROM kv WHERE k=?", (key,)).fetchone()
+        if not row or (max_age_days is not None and time.time() - row[0] > max_age_days * 86400):
+            return None
+        return json.loads(row[1])
+
+    def set_json(self, key: str, value) -> None:
+        with self._db() as c:
+            c.execute("INSERT OR REPLACE INTO kv VALUES (?,?,?)",
+                      (key, time.time(), json.dumps(value, default=str)))
+
+    # ------------------------------------------------------------ my domains
+
+    def my_domains(self) -> dict[str, bool]:
+        """{domain: parked} for domains the user added or XML-ray found in reports."""
+        with self._db() as c:
+            return {n: bool(p) for n, p in c.execute("SELECT name, parked FROM domains ORDER BY name")}
+
+    def set_domain(self, name: str, parked: bool = False) -> None:
+        with self._db() as c:
+            c.execute("INSERT INTO domains VALUES (?,?,?) ON CONFLICT(name) DO UPDATE SET "
+                      "parked=excluded.parked", (name.lower().strip("."), int(parked), time.time()))
+
+    def add_domains(self, names) -> None:
+        with self._db() as c:
+            c.executemany("INSERT OR IGNORE INTO domains VALUES (?,?,?)",
+                          [(n.lower().strip("."), 0, time.time()) for n in names])
+
+    def remove_domain(self, name: str) -> None:
+        with self._db() as c:
+            c.execute("DELETE FROM domains WHERE name=?", (name,))

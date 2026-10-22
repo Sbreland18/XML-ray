@@ -4,7 +4,9 @@
 
 XML-ray opens the DMARC aggregate reports that Gmail, Outlook, Yahoo and others email you,
 and turns them into a plain-English action plan: what's broken, what's spoofing you, and what
-to fix first. Reports are read on your computer and never uploaded anywhere.
+to fix first. Reports are read on your computer and never uploaded anywhere. Blocklists are queried
+through your own network's DNS server; some lists refuse queries from large public DNS
+services, which XML-ray shows as "Couldn't check" rather than "Clear".
 
 ## What it does
 
@@ -19,11 +21,21 @@ to fix first. Reports are read on your computer and never uploaded anywhere.
 - **TLS reports**: reads SMTP TLS reports (TLS-RPT) to show whether email sent to you arrives encrypted.
 - **Automatic import**: from an IMAP mailbox (Gmail/Google Workspace with an app password, Yahoo, iCloud, Fastmail, Zoho and others) or a watched folder.
 - **Alerts**: a notification when a new unknown sender appears, a working service starts failing, or the pass rate drops.
+- **"Show me how to fix this"**: for every problem, the exact DNS record to add or change (current vs new value, with copy buttons), steps for your DNS host (detected automatically: Cloudflare, GoDaddy, Namecheap, Route 53, Azure, Microsoft 365, IONOS and more), a **Check if it worked** button, and a ready-to-send email for whoever manages your DNS.
+- **Road to protection**: a checklist from monitoring to p=reject that says when each enforcement step is safe (two weeks at the current step with 98% of legitimate mail passing).
+- **Parked domains**: add domains that never send email and XML-ray checks they're locked down (SPF -all, DMARC reject, null MX).
+- **MTA-STS and BIMI checks**, including the policy file and logo format.
+- **Spam blocklist check** of your own sending servers (Spamhaus, SpamCop, Barracuda, PSBL), with removal links.
+- **Lookalike domain watch**: finds registered misspellings and look-alike domains of yours and flags new ones that can send email.
+- **Weekly summary email** to you or a manager.
+- **Report drill-down**: double-click any report to see every row and the original file.
 - **Exports**: HTML summary, PDF summary, CSV of senders.
 - **Light and dark mode**, following Windows by default.
 - **Updates itself** from GitHub Releases.
 
-Reports are read on your computer and never uploaded anywhere. The DNS check (DNS over
+Reports are read on your computer and never uploaded anywhere. Blocklists are queried
+through your own network's DNS server; some lists refuse queries from large public DNS
+services, which XML-ray shows as "Couldn't check" rather than "Clear". The DNS check (DNS over
 HTTPS via Cloudflare/Google) and the owner lookups (rdap.org) only send domain names and IP
 addresses, and both can be turned off in Settings.
 
@@ -40,6 +52,12 @@ xmlray/
   rdap.py                    Network owner and country lookups
   mailimport.py              IMAP mailbox import and watched folder
   alerts.py                  Change detection for alerts
+  fixguide.py                "Show me how to fix this": exact changes, DNS hosts, verification
+  roadmap.py                 Road to protection checklist
+  blocklist.py               Spam blocklist (DNSBL) checks
+  lookalike.py               Lookalike domain watch
+  mailsend.py                Weekly summary email (SMTP)
+  logs.py                    Error log and diagnostics
   recordbuilder.py           DMARC record builder logic
   guides.py                  Links to each service's setup guide
   senders.py                 Known-service detection and reverse DNS
@@ -49,6 +67,7 @@ xmlray/
   assets/                    Icon and sample reports
 builder/release_manager.py   GUI that builds the installer and publishes releases
 builder/github_sync.py       Uploads source code to GitHub without Git
+builder/signing.py           Code signing with signtool.exe
 tools/make_samples.py        Regenerates the two-week sample data
 packaging/                   PyInstaller recipe and Inno Setup installer script
 tests/                       pytest tests
@@ -105,6 +124,13 @@ that changed, and it skips `dist`, `build`, `.venv` and anything in `.gitignore`
 
 If the folder is a Git clone, you can choose **Commit and push with Git** instead.
 
+The tests run first (untick **Run the tests first** to skip them); if any fail, nothing is
+built or published.
+
+**Code signing** (optional): choose a certificate file (.pfx), a certificate in the Windows
+store (USB token / EV) or Azure Trusted Signing. XML-ray.exe, the installer and the
+uninstaller are all signed. You need signtool.exe from the Windows SDK.
+
 **Build installer** alone is useful for testing before you publish. **Draft** and
 **Pre-release** releases are never offered to users.
 
@@ -130,3 +156,7 @@ Saved reports, sender labels, "done" marks and alerts are in
 `%LOCALAPPDATA%\XML-ray\history.db`. Settings are in the Windows registry under
 `HKEY_CURRENT_USER\Software\XML-ray`. A mailbox password is stored in Windows Credential
 Manager, never in a file. Uninstalling leaves the history in place, so reinstalling keeps it.
+
+If something goes wrong, **Help > Save diagnostics for support** creates a zip with XML-ray's
+log and settings (no reports, passwords or tokens) that users can attach to a GitHub issue.
+The log itself is in `%LOCALAPPDATA%\XML-ray\logs`.

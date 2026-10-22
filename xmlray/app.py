@@ -5,6 +5,7 @@ from PySide6.QtCore import QSettings
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
+from . import logs
 from .__version__ import __version__
 from .config import APP_NAME, ORG_NAME, asset
 from .ui import style
@@ -20,6 +21,7 @@ def main() -> None:
         except Exception:  # noqa: BLE001
             pass
 
+    logs.setup()
     QApplication.setApplicationName(APP_NAME)
     QApplication.setOrganizationName(ORG_NAME)
     QApplication.setApplicationVersion(__version__)

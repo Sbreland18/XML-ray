@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import mailimport, recordbuilder, winstartup
+from .. import mailimport, mailsend, recordbuilder, winstartup
 from ..updater import ReleaseInfo
 
 GLOSSARY_HTML = """
@@ -143,16 +143,23 @@ def _hint(text: str) -> QLabel:
 class SettingsDialog(QDialog):
     """All preferences. Reads and writes QSettings; the caller re-reads them afterwards."""
 
-    def __init__(self, settings: QSettings, parent=None, start_tab: int = 0):
+    TAB_GENERAL, TAB_MAILBOX, TAB_FOLDER, TAB_DOMAINS, TAB_SUMMARY, TAB_ALERTS = range(6)
+
+    def __init__(self, settings: QSettings, parent=None, start_tab: int = 0, storage=None,
+                 send_test=None):
         super().__init__(parent)
         self.s = settings
+        self.storage = storage
+        self.send_test = send_test
         self.setWindowTitle("Settings")
-        self.resize(600, 560)
+        self.resize(640, 600)
         lay = QVBoxLayout(self)
         self.tabs = QTabWidget()
         self.tabs.addTab(self._general(), "General")
         self.tabs.addTab(self._mailbox(), "Mailbox")
         self.tabs.addTab(self._folder(), "Watched folder")
+        self.tabs.addTab(self._domains(), "Domains")
+        self.tabs.addTab(self._summary(), "Summary email")
         self.tabs.addTab(self._alerts(), "Alerts")
         self.tabs.setCurrentIndex(start_tab)
         lay.addWidget(self.tabs, 1)
@@ -185,9 +192,13 @@ class SettingsDialog(QDialog):
         self.rdap.setChecked(self._val("lookup/rdap", True, bool))
         self.dns = QCheckBox("Check my domain's live DNS records automatically")
         self.dns.setChecked(self._val("lookup/dns", True, bool))
+        self.blocklists = QCheckBox("Check my sending servers against spam blocklists")
+        self.blocklists.setChecked(self._val("lookup/blocklist", True, bool))
+        self.lookalikes = QCheckBox("Look for lookalike domains once a week")
+        self.lookalikes.setChecked(self._val("lookup/lookalike", True, bool))
         self.updates = QCheckBox("Check for XML-ray updates when it starts")
         self.updates.setChecked(self._val("updates/check_on_startup", True, bool))
-        for cb in (self.rdns, self.rdap, self.dns, self.updates):
+        for cb in (self.rdns, self.rdap, self.dns, self.blocklists, self.lookalikes, self.updates):
             f.addRow("", cb)
         self.tray = QCheckBox("Keep running in the system tray when I close the window")
         self.tray.setChecked(self._val("tray/enabled", False, bool))
@@ -285,6 +296,147 @@ class SettingsDialog(QDialog):
         v.addStretch(1)
         return w
 
+    def _domains(self) -> QWidget:
+        w = QWidget(objectName="TabHost")
+        v = QVBoxLayout(w)
+        v.addWidget(_hint("Domains from your reports are added here automatically. Add the "
+                          "other domains you own, and tick “Parked” for any that never send or "
+                          "receive email: XML-ray checks they're locked down against spoofing."))
+        self.domain_list = QListWidget()
+        v.addWidget(self.domain_list, 1)
+        row = QHBoxLayout()
+        add = QPushButton("Add a domain…")
+        add.clicked.connect(self._add_domain)
+        remove = QPushButton("Remove")
+        remove.clicked.connect(self._remove_domain)
+        row.addWidget(add)
+        row.addWidget(remove)
+        row.addStretch(1)
+        v.addLayout(row)
+        self._removed: set[str] = set()
+        for name, parked in (self.storage.my_domains().items() if self.storage else []):
+            self._domain_item(name, parked)
+        return w
+
+    def _domain_item(self, name: str, parked: bool):
+        item = QListWidgetItem(name)
+        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+        item.setCheckState(Qt.Checked if parked else Qt.Unchecked)
+        item.setToolTip("Tick if this domain never sends or receives email (parked).")
+        item.setData(Qt.UserRole, name)
+        item.setText(f"{name}    (tick if parked)")
+        self.domain_list.addItem(item)
+
+    def _add_domain(self):
+        from PySide6.QtWidgets import QInputDialog
+        text, ok = QInputDialog.getText(self, "Add a domain", "Domain name (for example "
+                                        "example.net):")
+        name = text.strip().lower().removeprefix("http://").removeprefix("https://").strip("/.")
+        if ok and "." in name and " " not in name:
+            self._domain_item(name, False)
+
+    def _remove_domain(self):
+        item = self.domain_list.currentItem()
+        if item:
+            self._removed.add(item.data(Qt.UserRole))
+            self.domain_list.takeItem(self.domain_list.row(item))
+
+    def _summary(self) -> QWidget:
+        w = QWidget(objectName="TabHost")
+        v = QVBoxLayout(w)
+        self.sum_on = QCheckBox("Email a weekly summary")
+        self.sum_on.setChecked(self._val("summary/enabled", False, bool))
+        v.addWidget(self.sum_on)
+        f = QFormLayout()
+        self.sum_preset = QComboBox()
+        self.sum_preset.addItems(list(mailsend.PRESETS))
+        self.sum_preset.setCurrentText(self._val("summary/preset", "Gmail / Google Workspace"))
+        self.sum_preset.currentTextChanged.connect(self._apply_smtp_preset)
+        f.addRow("Provider", self.sum_preset)
+        self.smtp_host = QLineEdit(self._val("summary/host", "smtp.gmail.com"))
+        self.smtp_port = QSpinBox()
+        self.smtp_port.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.smtp_port.setRange(1, 65535)
+        self.smtp_port.setValue(self._val("summary/port", 587, int))
+        self.smtp_sec = QComboBox()
+        for label, val in (("STARTTLS", "starttls"), ("SSL/TLS", "ssl"), ("None", "none")):
+            self.smtp_sec.addItem(label, val)
+        self.smtp_sec.setCurrentIndex(max(self.smtp_sec.findData(self._val("summary/security", "starttls")), 0))
+        row = QHBoxLayout()
+        row.addWidget(self.smtp_host, 1)
+        row.addWidget(QLabel("Port"))
+        row.addWidget(self.smtp_port)
+        row.addWidget(self.smtp_sec)
+        f.addRow("SMTP server", row)
+        self.smtp_user = QLineEdit(self._val("summary/username", ""))
+        f.addRow("User name", self.smtp_user)
+        self.smtp_pass = QLineEdit()
+        self.smtp_pass.setEchoMode(QLineEdit.Password)
+        self.smtp_pass.setPlaceholderText("Saved securely in Windows Credential Manager")
+        f.addRow("Password", self.smtp_pass)
+        self.smtp_hint = _hint("")
+        f.addRow("", self.smtp_hint)
+        self.sum_from = QLineEdit(self._val("summary/from", ""))
+        self.sum_from.setPlaceholderText("you@yourdomain.com")
+        f.addRow("From", self.sum_from)
+        self.sum_to = QLineEdit(self._val("summary/to", ""))
+        self.sum_to.setPlaceholderText("manager@yourdomain.com, it@yourdomain.com")
+        f.addRow("Send to", self.sum_to)
+        when = QHBoxLayout()
+        self.sum_day = QComboBox()
+        self.sum_day.addItems(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+                               "Saturday", "Sunday"])
+        self.sum_day.setCurrentIndex(self._val("summary/day", 0, int))
+        self.sum_hour = QComboBox()
+        for h in range(24):
+            self.sum_hour.addItem(f"{(h % 12) or 12}:00 {'AM' if h < 12 else 'PM'}", h)
+        self.sum_hour.setCurrentIndex(self._val("summary/hour", 8, int))
+        when.addWidget(self.sum_day)
+        when.addWidget(QLabel("at"))
+        when.addWidget(self.sum_hour)
+        when.addStretch(1)
+        f.addRow("Every", when)
+        v.addLayout(f)
+        test = QPushButton("Send a test now")
+        test.clicked.connect(self._send_test)
+        v.addWidget(test, 0, Qt.AlignLeft)
+        v.addWidget(_hint("The summary has your grade, the pass rate compared with the week "
+                          "before, the top items to fix and any alerts. XML-ray must be "
+                          "running (it can run in the tray) at the scheduled time; if it "
+                          "isn't, the summary is sent the next time it opens."))
+        v.addStretch(1)
+        self._apply_smtp_preset(self.sum_preset.currentText(), keep=True)
+        return w
+
+    def _apply_smtp_preset(self, name: str, keep: bool = False):
+        host, port, sec, hint = mailsend.PRESETS.get(name, ("", 587, "starttls", ""))
+        if not keep and host:
+            self.smtp_host.setText(host)
+            self.smtp_port.setValue(port)
+            self.smtp_sec.setCurrentIndex(max(self.smtp_sec.findData(sec), 0))
+        self.smtp_hint.setText(hint)
+
+    def smtp_config(self) -> mailsend.SmtpConfig:
+        return mailsend.SmtpConfig(
+            host=self.smtp_host.text().strip(), username=self.smtp_user.text().strip(),
+            from_addr=self.sum_from.text().strip(), to=self.sum_to.text().strip(),
+            port=self.smtp_port.value(), security=self.smtp_sec.currentData())
+
+    def _send_test(self):
+        cfg = self.smtp_config()
+        password = self.smtp_pass.text() or mailsend.get_password(cfg)
+        if not self.send_test:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self.send_test(cfg, password)
+        except mailsend.SendError as exc:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "Couldn't send", str(exc))
+            return
+        QApplication.restoreOverrideCursor()
+        QMessageBox.information(self, "Sent", f"A test summary was sent to {cfg.to}.")
+
     def _alerts(self) -> QWidget:
         w = QWidget(objectName="TabHost")
         v = QVBoxLayout(w)
@@ -348,6 +500,8 @@ class SettingsDialog(QDialog):
         s.setValue("lookup/rdap", self.rdap.isChecked())
         s.setValue("lookup/dns", self.dns.isChecked())
         s.setValue("updates/check_on_startup", self.updates.isChecked())
+        s.setValue("lookup/blocklist", self.blocklists.isChecked())
+        s.setValue("lookup/lookalike", self.lookalikes.isChecked())
         s.setValue("tray/enabled", self.tray.isChecked())
         if winstartup.supported():
             try:
@@ -380,9 +534,36 @@ class SettingsDialog(QDialog):
             return
         s.setValue("folder/enabled", self.watch_on.isChecked())
         s.setValue("folder/path", self.watch_path.text().strip())
+        if self.storage:
+            for name in self._removed:
+                self.storage.remove_domain(name)
+            for i in range(self.domain_list.count()):
+                it = self.domain_list.item(i)
+                self.storage.set_domain(it.data(Qt.UserRole), it.checkState() == Qt.Checked)
+        sc = self.smtp_config()
+        if self.sum_on.isChecked() and (not sc.host or not sc.recipients or not sc.from_addr):
+            QMessageBox.warning(self, "Summary email details missing", "Fill in the SMTP "
+                                "server, From and Send to, or turn off the weekly summary.")
+            self.tabs.setCurrentIndex(self.TAB_SUMMARY)
+            return
+        if self.smtp_pass.text() and not mailsend.set_password(sc, self.smtp_pass.text()):
+            QMessageBox.warning(self, "Password not saved", "The SMTP password couldn't be "
+                                "saved in Windows Credential Manager.")
+        for key, val in (("enabled", self.sum_on.isChecked()), ("preset", self.sum_preset.currentText()),
+                         ("host", sc.host), ("port", sc.port), ("security", sc.security),
+                         ("username", sc.username), ("from", sc.from_addr), ("to", sc.to),
+                         ("day", self.sum_day.currentIndex()), ("hour", self.sum_hour.currentData())):
+            s.setValue(f"summary/{key}", val)
         s.setValue("alerts/enabled", self.alerts_on.isChecked())
         s.setValue("alerts/notify", self.notify.isChecked())
         self.accept()
+
+
+def smtp_config(s: QSettings) -> mailsend.SmtpConfig:
+    return mailsend.SmtpConfig(
+        host=s.value("summary/host", ""), username=s.value("summary/username", ""),
+        from_addr=s.value("summary/from", ""), to=s.value("summary/to", ""),
+        port=s.value("summary/port", 587, type=int), security=s.value("summary/security", "starttls"))
 
 
 def mailbox_config(s: QSettings) -> mailimport.MailboxConfig:
